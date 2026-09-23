@@ -8,6 +8,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!PreviewMD.spec
 
 # ── Virtual environments ──
 .venv/
@@ -38,3 +39,6 @@ env/
 # ── Logs ──
 logs/
 *.log
+
+# ── Local AI helper notes (kept out of the repository) ──
+AGENTS.md

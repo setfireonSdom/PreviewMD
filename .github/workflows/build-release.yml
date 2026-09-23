@@ -1,0 +1,78 @@
+name: macOS build and release
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release for the metadata version
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      name: ${{ steps.metadata.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install build and test dependencies in project venv
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt 'pyinstaller==6.20.0'
+      - name: Read release metadata
+        id: metadata
+        run: |
+          .venv/bin/python -c 'from app_metadata import APP_NAME, APP_VERSION; print(f"tag=v{APP_VERSION}"); print(f"name={APP_NAME} {APP_VERSION}")' >> "$GITHUB_OUTPUT"
+      - name: Check shell syntax and run tests
+        run: |
+          bash -n build.sh
+          .venv/bin/python -B -m unittest discover -s tests -v
+      - name: Build app and DMG
+        env:
+          PYTHON: ${{ github.workspace }}/.venv/bin/python
+        run: bash build.sh
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: PreviewMD-macos-${{ runner.arch }}
+          path: dist/*/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PreviewMD-macos-*
+          path: release-artifacts
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_NAME: ${{ needs.build.outputs.name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          gh release create "$RELEASE_TAG" release-artifacts/*.dmg \
+            --target "$RELEASE_COMMIT" \
+            --title "$RELEASE_NAME" \
+            --notes 'macOS build. Ad-hoc signed; not Developer ID signed or notarized.'
