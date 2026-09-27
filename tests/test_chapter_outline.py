@@ -59,7 +59,33 @@ class ChapterOutlineTests(unittest.TestCase):
 
     def test_existing_ids_are_not_overwritten(self):
         # In-document links depend on ids the document already had.
-        self.assertIn("if (!element.id) {", self.document)
+        self.assertIn("if (!target.element.id) {", self.document)
+
+    def test_a_closed_outline_does_no_work_at_all(self):
+        # The render that just finished replaced the elements the outline points
+        # at, and nobody can see a closed sidebar, so collecting is pure waste.
+        self.assertIn(
+            "if (!force && !document.body.classList.contains('toc-open')) {",
+            self.document,
+        )
+
+    def test_opening_the_outline_forces_a_rebuild(self):
+        # Without this the outline would be built against elements the last
+        # render already detached, and clicking an entry would scroll nowhere.
+        self.assertIn("if (open) rebuildToc(true);", self.document)
+
+    def test_an_unchanged_outline_reuses_the_existing_buttons(self):
+        # Typing inside a chapter does not change the chapter list at all, so
+        # the buttons are kept and only the element references are refreshed.
+        self.assertIn("if (!force && tocTargetsMatch(targets)) {", self.document)
+        self.assertIn("function tocTargetsMatch(targets) {", self.document)
+
+    def test_the_reuse_check_is_exact_rather_than_a_hash(self):
+        # A hash collision would read as "unchanged" and leave a stale button
+        # behind, which is the one failure direction that matters.
+        self.assertNotIn("function computeTocSignature(", self.document)
+        self.assertIn("if (targets[i].label !== tocTargets[i].label) return false;", self.document)
+        self.assertIn("if (targets[i].id !== tocTargets[i].id) return false;", self.document)
 
 
 class ReadingPositionTests(unittest.TestCase):

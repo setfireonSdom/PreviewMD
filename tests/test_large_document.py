@@ -140,9 +140,11 @@ class ScrollResponsivenessTests(unittest.TestCase):
             "function scheduleActiveHeadingUpdate()",
             "activeHeadingFrame = requestAnimationFrame(function() {",
             "if (!document.body.classList.contains('toc-open')) return;",
-            "if (open) updateActiveHeading();",
         ):
             self.assertIn(marker, self.document)
+        # Opening the sidebar rebuilds the outline first, then marks the entry
+        # that is currently on screen.
+        self.assertIn("if (open) rebuildToc(true);\n    updateActiveHeading();\n}", self.document)
 
     def test_active_heading_touches_only_the_changed_button(self):
         for marker in (

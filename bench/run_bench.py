@@ -161,6 +161,12 @@ function wait(ms) {
     if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
     await wait(120);
 
+    // Open the outline the way a user does, before measuring it. While the
+    // sidebar is closed, renders deliberately skip building it, so toggling is
+    // what forces the build.
+    toggleToc();
+    await wait(60);
+
     results.source = tocSource;
     results.targetCount = tocTargets.length;
     results.buttonCount = document.querySelectorAll("#toc-list button").length;
@@ -184,10 +190,8 @@ function wait(ms) {
         results.duplicateChapters = duplicates;
         results.nonChapterTargets = unparsed;
 
-        // Open the outline, jump to the middle, and confirm the highlight follows.
         // updateActiveHeading is called directly: requestAnimationFrame does not
         // fire in an offscreen webview.
-        document.body.classList.add("toc-open");
         var middle = tocTargets[Math.floor(tocTargets.length / 2)].element;
         var content = document.getElementById("content");
         content.scrollTop = middle.offsetTop - 20;
@@ -296,7 +300,9 @@ function wait(ms) {
         var content = document.getElementById("content");
         var range = content.scrollHeight - content.clientHeight;
         results.range = range;
-        results.targets = tocTargets.length;
+        // Reported after the outline is opened below: while the sidebar is
+        // closed, renders skip building it on purpose.
+        results.targetsWhileClosed = tocTargets.length;
 
         // With the outline closed, scrolling must not do any outline work.
         var closedStart = performance.now();
@@ -307,9 +313,10 @@ function wait(ms) {
         results.closedMs = Math.round((performance.now() - closedStart) * 100) / 100;
 
         // With the outline open, every frame locates the active chapter and
-        // refreshes the progress line.
-        document.body.classList.add("toc-open");
+        // refreshes the progress line. Opening it goes through toggleToc().
+        toggleToc();
         updateActiveHeading();
+        results.targets = tocTargets.length;
         var openStart = performance.now();
         for (var j = 0; j < 200; j++) {
             content.scrollTop = (range * j) / 200;
@@ -430,6 +437,106 @@ function wait(ms) {
 """
 
 
+TOC_BUILD_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+function round2(value) {
+    return Math.round(value * 100) / 100;
+}
+(async function () {
+    var results = {};
+    try {
+        window.addTabFromPython("novel.txt", null, window.__BENCH_DOC, null);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(150);
+
+        results.targets = tocTargets.length;
+        results.tocOpenDuringTest = document.body.classList.contains("toc-open");
+
+        // What any "skip the rebuild" strategy has to pay to find out whether
+        // the outline actually changed: collect the targets, build nothing.
+        var collectRuns = [];
+        for (var c = 0; c < 3; c++) {
+            var c0 = performance.now();
+            collectTocTargets();
+            collectRuns.push(performance.now() - c0);
+        }
+        results.collectOnlyMs = round2(collectRuns[1]);
+
+        // One full rebuild, split into collection and everything else.
+        var fullRuns = [];
+        for (var f = 0; f < 3; f++) {
+            var f0 = performance.now();
+            rebuildToc();
+            fullRuns.push(performance.now() - f0);
+        }
+        results.fullRebuildMs = round2(fullRuns[1]);
+        results.domAndLayoutMs = round2(fullRuns[1] - collectRuns[1]);
+
+        // Count what typing in split view actually triggers. The content
+        // changes every time, so the "identical content" skip never applies.
+        var calls = 0;
+        var totalMs = 0;
+        var original = rebuildToc;
+        rebuildToc = function() {
+            calls += 1;
+            var started = performance.now();
+            var result = original.apply(this, arguments);
+            totalMs += performance.now() - started;
+            return result;
+        };
+        for (var i = 1; i <= 3; i++) {
+            renderContent(window.__BENCH_DOC + "\n\n\u7b2c" + i + " \u6b21\u6539\u52a8", null, true, tabs[0]);
+            if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        }
+        results.typingRenders = 3;
+        results.rebuildsDuringTyping = calls;
+        results.rebuildMsDuringTyping = round2(totalMs);
+
+        // With the outline open, typing inside a chapter leaves the chapter list
+        // unchanged, so the buttons should be kept rather than rebuilt.
+        toggleToc();
+        var openCalls = 0;
+        var openMs = 0;
+        var originalOpen = rebuildToc;
+        rebuildToc = function() {
+            openCalls += 1;
+            var t3 = performance.now();
+            var r = originalOpen.apply(this, arguments);
+            openMs += performance.now() - t3;
+            return r;
+        };
+        var buttonsBefore = document.querySelectorAll("#toc-list button").length;
+        for (var j = 1; j <= 3; j++) {
+            // 改动落在章节正文里，不新增也不删除章节
+            renderContent(window.__BENCH_DOC + "\n\n\u6b63\u6587\u6539\u52a8 " + j, null, true, tabs[0]);
+            if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        }
+        results.openRebuildsDuringTyping = openCalls;
+        results.openRebuildMsDuringTyping = round2(openMs);
+        results.buttonsReused = document.querySelectorAll("#toc-list button").length === buttonsBefore;
+        results.openTargets = tocTargets.length;
+        results.openTargetAttached = document.contains(tocTargets[Math.floor(tocTargets.length / 2)].element);
+
+        // Are the collected elements still attached after a re-render? This is
+        // what makes "skip the rebuild" unsafe without rebuilding on open.
+        var before = tocTargets[Math.floor(tocTargets.length / 2)].element;
+        renderContent(window.__BENCH_DOC + "\n\n\u53e6\u4e00\u6b21", null, true, tabs[0]);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        results.targetStillAttached = document.contains(before);
+    } catch (error) {
+        results.error = [error && error.name, error && error.message, error && error.stack].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
 def synthetic_samples() -> dict[str, str]:
     paragraph = (
         "一般年轻的读者，一看这本书是文言文，也许会以为难得读懂，不感兴趣。"
@@ -534,6 +641,9 @@ def main() -> int:
     parser.add_argument(
         "--errors", action="store_true", help="verify global JavaScript error reporting"
     )
+    parser.add_argument(
+        "--toc-build", action="store_true", help="measure what building the outline costs"
+    )
     parser.add_argument("--json", action="store_true", help="print raw JSON")
     args = parser.parse_args()
 
@@ -567,6 +677,12 @@ def main() -> int:
     if args.errors:
         sample = samples[next(iter(samples))]
         report = run_in_webview(build_page(sample, args.editor), ERROR_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.toc_build:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), TOC_BUILD_WORKLOAD)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 

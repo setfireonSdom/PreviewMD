@@ -16,6 +16,13 @@ venv/
 env/
 *.env
 
+# Lock files from alternative installers. The project installs with pip from
+# requirements.txt (README, CI, and build.sh all agree on that), so a stray
+# uv.lock or poetry.lock is a local artefact, not a source of truth.
+uv.lock
+poetry.lock
+Pipfile.lock
+
 # ── macOS ──
 .DS_Store
 .AppleDouble
