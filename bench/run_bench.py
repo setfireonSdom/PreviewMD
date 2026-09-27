@@ -147,6 +147,227 @@ function wait(ms) {
 """
 
 
+TOC_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+(async function () {
+    var results = {};
+    try {
+    window.addTabFromPython("novel.txt", null, window.__BENCH_DOC, null);
+    if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+    await wait(120);
+
+    results.source = tocSource;
+    results.targetCount = tocTargets.length;
+    results.buttonCount = document.querySelectorAll("#toc-list button").length;
+
+    if (tocTargets.length) {
+        results.first = tocTargets[0].label.slice(0, 28);
+        results.middle = tocTargets[Math.floor(tocTargets.length / 2)].label.slice(0, 28);
+        results.last = tocTargets[tocTargets.length - 1].label.slice(0, 28);
+
+        // Chapter lines repeat in converted books; they must collapse by number.
+        var seen = {};
+        var duplicates = 0;
+        var unparsed = 0;
+        tocTargets.forEach(function(target) {
+            var match = CHAPTER_PATTERN.exec(target.label);
+            if (!match) { unparsed += 1; return; }
+            var key = chapterKey(match[1]);
+            if (seen[key]) duplicates += 1;
+            seen[key] = true;
+        });
+        results.duplicateChapters = duplicates;
+        results.nonChapterTargets = unparsed;
+
+        // Open the outline, jump to the middle, and confirm the highlight follows.
+        // updateActiveHeading is called directly: requestAnimationFrame does not
+        // fire in an offscreen webview.
+        document.body.classList.add("toc-open");
+        var middle = tocTargets[Math.floor(tocTargets.length / 2)].element;
+        var content = document.getElementById("content");
+        content.scrollTop = middle.offsetTop - 20;
+        updateActiveHeading();
+        await wait(60);
+        results.activeFollowsScroll = activeTocId === middle.id;
+        results.activeLabel = (tocButtons.get(activeTocId) || {}).textContent;
+        results.progressText = document.getElementById("toc-progress").textContent;
+        results.progressVisible = !document.getElementById("toc-progress").hidden;
+
+        // The sidebar must scroll the active entry into view.
+        var sidebar = document.getElementById("toc-sidebar");
+        var button = tocButtons.get(activeTocId);
+        var sidebarRect = sidebar.getBoundingClientRect();
+        var buttonRect = button.getBoundingClientRect();
+        results.tocDebug = {
+            sidebarScrollTop: sidebar.scrollTop,
+            sidebarScrollHeight: sidebar.scrollHeight,
+            sidebarClientHeight: sidebar.clientHeight,
+            sidebarOverflowY: getComputedStyle(sidebar).overflowY,
+            sidebarTop: Math.round(sidebarRect.top),
+            sidebarBottom: Math.round(sidebarRect.bottom),
+            buttonTop: Math.round(buttonRect.top),
+            buttonBottom: Math.round(buttonRect.bottom),
+        };
+        results.tocFollowedIntoView =
+            buttonRect.top >= sidebarRect.top - 2 && buttonRect.bottom <= sidebarRect.bottom + 2;
+    }
+    } catch (error) {
+        results.error = [
+            error && error.name,
+            error && error.message,
+            error && error.stack,
+        ].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
+POSITION_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+(async function () {
+    var results = {};
+    try {
+        var path = "/Users/tester/book.txt";
+        window.addTabFromPython("book.txt", path, window.__BENCH_DOC, null);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(120);
+
+        var content = document.getElementById("content");
+        content.scrollTop = (content.scrollHeight - content.clientHeight) * 0.5;
+        await wait(60);
+        captureActiveScrolls();
+
+        var state = sessionState();
+        results.savedRatio = state.positions[path];
+        results.savedKeys = Object.keys(state.positions).length;
+        results.activeRatio = Math.round(tabs[0].previewRatio * 10000) / 10000;
+
+        // Re-open the same document from scratch and restore the saved position.
+        var keep = state.positions[path];
+        tabs.splice(0, tabs.length);
+        activeIdx = -1;
+        content.replaceChildren();
+        window.addTabFromPython("book.txt", path, window.__BENCH_DOC, null);
+        window.finishSessionRestore({ active: 0, view_mode: "preview", positions: (function () {
+            var out = {}; out[path] = keep; return out;
+        })() });
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(200);
+
+        var range = content.scrollHeight - content.clientHeight;
+        results.restoredRatio = range > 0 ? Math.round((content.scrollTop / range) * 10000) / 10000 : null;
+        results.restoredWithinTwoPercent =
+            results.restoredRatio !== null && Math.abs(results.restoredRatio - keep) < 0.02;
+    } catch (error) {
+        results.error = [error && error.name, error && error.message, error && error.stack].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
+SCROLL_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+(async function () {
+    var results = {};
+    try {
+        window.addTabFromPython("novel.txt", null, window.__BENCH_DOC, null);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(120);
+
+        var content = document.getElementById("content");
+        var range = content.scrollHeight - content.clientHeight;
+        results.range = range;
+        results.targets = tocTargets.length;
+
+        // With the outline closed, scrolling must not do any outline work.
+        var closedStart = performance.now();
+        for (var i = 0; i < 200; i++) {
+            content.scrollTop = (range * i) / 200;
+            updateActiveHeading();
+        }
+        results.closedMs = Math.round((performance.now() - closedStart) * 100) / 100;
+
+        // With the outline open, every frame locates the active chapter and
+        // refreshes the progress line.
+        document.body.classList.add("toc-open");
+        updateActiveHeading();
+        var openStart = performance.now();
+        for (var j = 0; j < 200; j++) {
+            content.scrollTop = (range * j) / 200;
+            updateActiveHeading();
+        }
+        var openTotal = performance.now() - openStart;
+        results.openMs = Math.round(openTotal * 100) / 100;
+        results.perFrameMs = Math.round((openTotal / 200) * 1000) / 1000;
+
+        // A linear scan over every chapter, for comparison with the binary search.
+        var linearStart = performance.now();
+        var contentTop = content.getBoundingClientRect().top;
+        for (var k = 0; k < 200; k++) {
+            var current = tocTargets[0].element;
+            for (var n = 0; n < tocTargets.length; n++) {
+                if (tocTargets[n].element.getBoundingClientRect().top - contentTop <= 48) {
+                    current = tocTargets[n].element;
+                } else {
+                    break;
+                }
+            }
+        }
+        results.linearMs = Math.round((performance.now() - linearStart) * 100) / 100;
+
+        // The same walk, locating the chapter only. This is what every scroll
+        // frame costs in practice; the progress line is the rest.
+        var binaryStart = performance.now();
+        for (var m = 0; m < 200; m++) {
+            content.scrollTop = (range * m) / 200;
+            activeTocTarget();
+        }
+        results.binaryOnlyMs = Math.round((performance.now() - binaryStart) * 100) / 100;
+        results.binaryOnlyPerFrameMs =
+            Math.round((results.binaryOnlyMs / 200) * 1000) / 1000;
+
+        // How often the progress line actually changes during a normal read:
+        // one screen at a time, the way a reader moves.
+        var screenSteps = 0;
+        var changes = 0;
+        var previous = document.getElementById("toc-progress").textContent;
+        for (var s = 0; s < 200; s++) {
+            content.scrollTop = (range * s) / 200;
+            updateActiveHeading();
+            var text = document.getElementById("toc-progress").textContent;
+            if (text !== previous) changes += 1;
+            previous = text;
+            screenSteps += 1;
+        }
+        results.progressTextChanges = changes + " of " + screenSteps;
+    } catch (error) {
+        results.error = [error && error.name, error && error.message, error && error.stack].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
 def synthetic_samples() -> dict[str, str]:
     paragraph = (
         "一般年轻的读者，一看这本书是文言文，也许会以为难得读懂，不感兴趣。"
@@ -239,6 +460,15 @@ def main() -> int:
     parser.add_argument(
         "--shortcuts", action="store_true", help="verify the tab keyboard shortcuts instead of timing"
     )
+    parser.add_argument(
+        "--toc", action="store_true", help="verify chapter detection and outline behaviour"
+    )
+    parser.add_argument(
+        "--position", action="store_true", help="verify the reading position is saved and restored"
+    )
+    parser.add_argument(
+        "--scroll", action="store_true", help="measure the per-frame cost of following the outline"
+    )
     parser.add_argument("--json", action="store_true", help="print raw JSON")
     args = parser.parse_args()
 
@@ -254,6 +484,24 @@ def main() -> int:
     if args.shortcuts:
         sample = samples[next(iter(samples))]
         report = run_in_webview(build_page(sample, args.editor), SHORTCUT_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.toc:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), TOC_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.position:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), POSITION_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.scroll:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), SCROLL_WORKLOAD)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 

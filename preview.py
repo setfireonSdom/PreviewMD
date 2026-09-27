@@ -274,6 +274,16 @@ MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 BINARY_SNIFF_BYTES = 8192
 DOCUMENT_ENCODINGS = ("utf-8-sig", "gb18030")
 DEFAULT_DOCUMENT_ENCODING = "utf-8-sig"
+# Byte-order marks are checked first: UTF-16 text is full of NUL bytes and would
+# otherwise be mistaken for a binary file. UTF-32 prefixes must precede UTF-16
+# because they share their first two bytes.
+DOCUMENT_BOM_ENCODINGS = (
+    (b"\xff\xfe\x00\x00", "utf-32"),
+    (b"\x00\x00\xfe\xff", "utf-32"),
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe", "utf-16"),
+    (b"\xfe\xff", "utf-16"),
+)
 
 
 class DocumentReadError(OSError):
@@ -284,7 +294,13 @@ class DocumentReadError(OSError):
 
 
 def decode_document(raw):
-    """Decode document bytes as UTF-8 (with or without BOM), else as GB18030."""
+    """Decode document bytes from a byte-order mark, else as UTF-8 or GB18030."""
+    for bom, encoding in DOCUMENT_BOM_ENCODINGS:
+        if raw.startswith(bom):
+            try:
+                return raw.decode(encoding), encoding
+            except UnicodeDecodeError:
+                break
     if b"\x00" in raw[:BINARY_SNIFF_BYTES]:
         raise DocumentReadError("这看起来是二进制文件，而不是文本")
     for encoding in DOCUMENT_ENCODINGS:
@@ -292,7 +308,7 @@ def decode_document(raw):
             return raw.decode(encoding), encoding
         except UnicodeDecodeError:
             continue
-    raise DocumentReadError("无法识别文件编码（既不是 UTF-8，也不是 GB18030）")
+    raise DocumentReadError("无法识别文件编码（不是 UTF-8 / UTF-16，也不是 GB18030）")
 
 
 def read_document(filepath):
@@ -422,6 +438,7 @@ def normalize_session(payload):
         "active": 0,
         "view_mode": "preview",
         "last_directory": "",
+        "positions": {},
     }
     if not isinstance(payload, dict):
         return session
@@ -445,6 +462,17 @@ def normalize_session(payload):
         session["last_directory"] = os.path.realpath(
             os.path.abspath(os.path.expanduser(raw_directory))
         )
+    raw_positions = payload.get("positions")
+    if isinstance(raw_positions, dict):
+        for path, ratio in raw_positions.items():
+            if not isinstance(path, str) or not path:
+                continue
+            try:
+                value = float(ratio)
+            except (TypeError, ValueError):
+                continue
+            resolved = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+            session["positions"][resolved] = min(1.0, max(0.0, value))
     return session
 
 
@@ -1111,6 +1139,19 @@ body.has-tabs #workspace {{ display: flex; }}
 }}
 body.toc-open #toc-sidebar {{ display: block; }}
 #toc-title {{ margin: 0 8px 9px; font-size: 12px; font-weight: 650; color: var(--dropzone-text); }}
+#toc-progress {{
+    margin: -4px 8px 9px;
+    font-size: 11px;
+    color: var(--dropzone-text);
+    opacity: 0.8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* The line changes on every scroll step. Without containment that
+       invalidates the whole document layout, and the next outline lookup has
+       to re-lay out a very long document while scrolling. */
+    contain: layout style;
+}}
 #toc-list {{ list-style: none; padding: 0; margin: 0; }}
 #toc-list button {{
     display: block; width: 100%; border: 0; border-radius: 4px;
@@ -1359,6 +1400,16 @@ body.edit-mode #content {{ display: none; }}
     #toc-sidebar {{ position: absolute; left: 0; top: 0; width: min(260px, 72vw); box-shadow: 5px 0 18px rgba(0,0,0,.2); }}
 }}
 
+/* Honour the system "reduce motion" setting for transitions and animations. */
+@media (prefers-reduced-motion: reduce) {{
+    *, *::before, *::after {{
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }}
+}}
+
 @media print {{
     html, body {{ height: auto; overflow: visible; background: #fff; color: #111; }}
     #tab-bar, #dropzone, #editor-wrap, #toc-sidebar, #search-bar, #conflict-banner,
@@ -1450,6 +1501,7 @@ body.edit-mode #content {{ display: none; }}
   <div id="workspace">
     <nav id="toc-sidebar" aria-label="Table of contents">
       <div id="toc-title">Table of contents</div>
+      <div id="toc-progress" hidden></div>
       <ol id="toc-list"></ol>
       <div id="toc-empty">No headings</div>
     </nav>
@@ -1952,12 +2004,17 @@ function syncNativeDirtyState() {{
 function sessionState() {{
     var paths = [];
     var active = 0;
+    var positions = {{}};
     for (var i = 0; i < tabs.length; i++) {{
-        if (!tabs[i].path) continue;
+        var tab = tabs[i];
+        if (!tab.path) continue;
         if (i <= activeIdx) active = paths.length;
-        paths.push(tabs[i].path);
+        paths.push(tab.path);
+        if (typeof tab.previewRatio === 'number' && tab.previewRatio > 0) {{
+            positions[tab.path] = Math.round(tab.previewRatio * 10000) / 10000;
+        }}
     }}
-    return {{ tabs: paths, active: active, view_mode: viewMode }};
+    return {{ tabs: paths, active: active, view_mode: viewMode, positions: positions }};
 }}
 
 function syncSession() {{
@@ -2059,54 +2116,202 @@ function headingSlug(text) {{
     return slug || 'section';
 }}
 
+function prefersReducedMotion() {{
+    return typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+}}
+
+function scrollBehavior() {{
+    return prefersReducedMotion() ? 'auto' : 'smooth';
+}}
+
 function scrollToHeading(target, behavior) {{
     var content = document.getElementById('content');
     if (!target || !content) return;
     var delta = target.getBoundingClientRect().top - content.getBoundingClientRect().top;
-    content.scrollTo({{ top: content.scrollTop + delta - 16, behavior: behavior || 'smooth' }});
+    content.scrollTo({{ top: content.scrollTop + delta - 16, behavior: behavior || scrollBehavior() }});
+}}
+
+// ── Table of contents ──
+// Real headings always win. Only documents with almost no heading structure (plain
+// text novels and converted text) fall back to detecting "第N章" chapter lines, so
+// a long unheaded book still gets a usable, clickable outline.
+var CHAPTER_PATTERN = /^[\\s\\u3000]*第\\s*([0-9零一二两三四五六七八九十百千万]+)\\s*[章节回卷部篇]/;
+var HEADING_TOC_FALLBACK_THRESHOLD = 3;
+var CHAPTER_TOC_LEVEL = 2;
+var CHINESE_DIGITS = '零一二两三四五六七八九';
+var CHINESE_UNITS = {{ 十: 10, 百: 100, 千: 1000, 万: 10000 }};
+var tocTargets = [];
+var tocSource = 'headings';
+
+function chineseToNumber(text) {{
+    if (/^[0-9]+$/.test(text)) return parseInt(text, 10);
+    var total = 0;
+    var section = 0;
+    var digit = 0;
+    for (var i = 0; i < text.length; i++) {{
+        var ch = text[i];
+        var digitIndex = CHINESE_DIGITS.indexOf(ch);
+        if (digitIndex >= 0) {{
+            digit = digitIndex;
+            continue;
+        }}
+        var unit = CHINESE_UNITS[ch];
+        if (unit === undefined) return null;
+        if (unit === 10000) {{
+            total += (section + digit) * unit;
+            section = 0;
+        }} else {{
+            section += (digit || 1) * unit;
+        }}
+        digit = 0;
+    }}
+    return total + section + digit;
+}}
+
+function chapterKey(numberText) {{
+    var value = chineseToNumber(numberText);
+    return value === null ? 'raw:' + numberText : 'n' + value;
+}}
+
+function firstMeaningfulText(element) {{
+    var walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null);
+    var node;
+    while ((node = walker.nextNode())) {{
+        var value = (node.nodeValue || '').trim();
+        if (value) return value;
+    }}
+    return '';
+}}
+
+function headingTarget(element) {{
+    return {{
+        element: element,
+        label: element.textContent.trim() || 'Untitled heading',
+        level: parseInt(element.tagName.slice(1), 10) || 1
+    }};
+}}
+
+// Chapter lines repeat in converted books (a contents line plus the real
+// heading), so collapse them by chapter number and keep the longest title.
+function collectChapterTargets(content) {{
+    var seen = new Map();
+    var children = content.children;
+    for (var i = 0; i < children.length; i++) {{
+        var block = children[i];
+        var firstText = firstMeaningfulText(block);
+        if (!firstText || firstText.charAt(0) !== '第') continue;
+        var match = CHAPTER_PATTERN.exec(firstText);
+        if (!match) continue;
+        var key = chapterKey(match[1]);
+        var existing = seen.get(key);
+        if (existing) {{
+            if (firstText.length > existing.label.length) {{
+                existing.label = firstText;
+                existing.element = block;
+            }}
+            continue;
+        }}
+        seen.set(key, {{ element: block, label: firstText, level: CHAPTER_TOC_LEVEL }});
+    }}
+    return Array.from(seen.values());
+}}
+
+function collectTocTargets() {{
+    var content = document.getElementById('content');
+    var headings = Array.from(content.querySelectorAll('h1, h2, h3, h4, h5, h6'));
+    if (headings.length >= HEADING_TOC_FALLBACK_THRESHOLD) {{
+        return {{ source: 'headings', targets: headings.map(headingTarget) }};
+    }}
+    var chapters = collectChapterTargets(content);
+    if (chapters.length) return {{ source: 'chapters', targets: chapters }};
+    return {{ source: 'headings', targets: headings.map(headingTarget) }};
 }}
 
 function rebuildToc() {{
-    var headings = Array.from(document.querySelectorAll('#content h1, #content h2, #content h3, #content h4, #content h5, #content h6'));
+    var collected = collectTocTargets();
+    tocSource = collected.source;
+    tocTargets = collected.targets;
     var counts = Object.create(null);
     var list = document.getElementById('toc-list');
     list.innerHTML = '';
     tocButtons = new Map();
     var fragment = document.createDocumentFragment();
-    headings.forEach(function(heading) {{
-        var slug = headingSlug(heading.textContent);
+    tocTargets.forEach(function(target) {{
+        var element = target.element;
+        var slug = headingSlug(target.label);
         counts[slug] = (counts[slug] || 0) + 1;
-        heading.id = 'previewmd-heading-' + slug + (counts[slug] > 1 ? '-' + counts[slug] : '');
+        // Never clobber an id the document already had: in-document links use it.
+        if (!element.id) {{
+            element.id = 'previewmd-heading-' + slug + (counts[slug] > 1 ? '-' + counts[slug] : '');
+        }}
+        var id = element.id;
         var item = document.createElement('li');
         var button = document.createElement('button');
         button.type = 'button';
-        button.textContent = heading.textContent.trim() || 'Untitled heading';
-        button.style.paddingLeft = (8 + (parseInt(heading.tagName.slice(1), 10) - 1) * 10) + 'px';
-        button.dataset.headingId = heading.id;
+        button.textContent = target.label;
+        button.style.paddingLeft = (8 + (target.level - 1) * 10) + 'px';
+        button.dataset.headingId = id;
         button.onclick = function() {{
             scrollToHeading(document.getElementById(button.dataset.headingId));
         }};
         item.appendChild(button);
         fragment.appendChild(item);
-        tocButtons.set(heading.id, button);
+        tocButtons.set(id, button);
     }});
     list.appendChild(fragment);
-    document.getElementById('toc-empty').style.display = headings.length ? 'none' : 'block';
+    var empty = document.getElementById('toc-empty');
+    empty.style.display = tocTargets.length ? 'none' : 'block';
+    empty.textContent = tocTargets.length ? '' : (tocSource === 'chapters' ? 'No chapters' : 'No headings');
+    document.getElementById('toc-progress').hidden = true;
     activeTocId = null;
     updateActiveHeading();
 }}
 
+// Targets are in document order, so their offsets are monotonic and the current
+// one can be found with a binary search. Reading 1500 rects per scroll frame
+// would make scrolling stutter.
+function activeTocTarget() {{
+    if (!tocTargets.length) return null;
+    var content = document.getElementById('content');
+    var contentTop = content.getBoundingClientRect().top;
+    var low = 0;
+    var high = tocTargets.length - 1;
+    var found = 0;
+    while (low <= high) {{
+        var middle = (low + high) >> 1;
+        if (tocTargets[middle].element.getBoundingClientRect().top - contentTop <= 48) {{
+            found = middle;
+            low = middle + 1;
+        }} else {{
+            high = middle - 1;
+        }}
+    }}
+    return tocTargets[found];
+}}
+
 function updateActiveHeading() {{
     if (!document.body.classList.contains('toc-open')) return;
-    var content = document.getElementById('content');
-    var headings = Array.from(content.querySelectorAll('h1, h2, h3, h4, h5, h6'));
-    var contentTop = content.getBoundingClientRect().top;
-    var current = headings.length ? headings[0] : null;
-    for (var i = 0; i < headings.length; i++) {{
-        if (headings[i].getBoundingClientRect().top - contentTop <= 48) current = headings[i];
-        else break;
+    var current = activeTocTarget();
+    if (!current) return;
+    // Progress first: showing it inserts a line above the list, which would
+    // otherwise shift the active entry out of view after it was scrolled to.
+    updateReadingProgress(current);
+    setActiveTocHeading(current.element.id);
+}}
+
+// Keep the active entry visible: a novel can have well over a thousand chapters,
+// so the current one is almost always scrolled out of the sidebar.
+function revealActiveTocButton() {{
+    var sidebar = document.getElementById('toc-sidebar');
+    var button = tocButtons.get(activeTocId);
+    if (!sidebar || !button) return;
+    var sidebarRect = sidebar.getBoundingClientRect();
+    var buttonRect = button.getBoundingClientRect();
+    if (buttonRect.top < sidebarRect.top + 30) {{
+        sidebar.scrollTop += buttonRect.top - sidebarRect.top - 34;
+    }} else if (buttonRect.bottom > sidebarRect.bottom - 6) {{
+        sidebar.scrollTop += buttonRect.bottom - sidebarRect.bottom + 10;
     }}
-    setActiveTocHeading(current ? current.id : null);
 }}
 
 function setActiveTocHeading(headingId) {{
@@ -2121,7 +2326,28 @@ function setActiveTocHeading(headingId) {{
     if (current) {{
         current.classList.add('active');
         current.setAttribute('aria-current', 'location');
+        revealActiveTocButton();
     }}
+}}
+
+function updateReadingProgress(target) {{
+    var progress = document.getElementById('toc-progress');
+    var content = document.getElementById('content');
+    if (!target || !content || !hasPreview()) {{
+        if (!progress.hidden) progress.hidden = true;
+        return;
+    }}
+    var range = content.scrollHeight - content.clientHeight;
+    var percent = range > 0 ? Math.round((content.scrollTop / range) * 100) : 100;
+    percent = Math.min(100, Math.max(0, percent));
+    var label = target.label;
+    if (label.length > 42) label = label.slice(0, 42) + '…';
+    var text = percent + '% · ' + label;
+    // Only write when the text changes. Writing on every frame would invalidate
+    // layout, so the next outline lookup would force a full re-layout of the
+    // document while scrolling.
+    if (progress.textContent !== text) progress.textContent = text;
+    if (progress.hidden) progress.hidden = false;
 }}
 
 // Scroll events fire in bursts; collapse them into one measurement per frame.
@@ -2456,8 +2682,13 @@ function renderActiveTab() {{
     document.body.classList.add('has-tabs');
     syncConflictBanner();
     if (hasPreview()) {{
-        renderContent(tab.content, tab.path, false, tab);
+        var rendered = renderContent(tab.content, tab.path, false, tab);
         document.getElementById('content').scrollTop = tab.previewScroll || 0;
+        // Large documents finish mounting in later batches, so the reading
+        // position can only be applied once the render settles.
+        if (rendered && rendered.then) {{
+            rendered.then(function() {{ applyPendingScrollPositions(tab); }});
+        }}
     }}
     if (hasEditor()) {{
         var editor = document.getElementById('editor');
@@ -2954,11 +3185,45 @@ async function saveFileAs() {{
     return true;
 }}
 
+function scrollRatio(element) {{
+    var range = element.scrollHeight - element.clientHeight;
+    return range > 0 ? Math.min(1, Math.max(0, element.scrollTop / range)) : 0;
+}}
+
+function applyScrollRatio(element, ratio) {{
+    if (typeof ratio !== 'number' || ratio <= 0) return false;
+    var range = element.scrollHeight - element.clientHeight;
+    if (range <= 0) return false;
+    element.scrollTop = ratio * range;
+    return true;
+}}
+
 function captureActiveScrolls() {{
     if (activeIdx < 0 || activeIdx >= tabs.length) return;
     var tab = tabs[activeIdx];
-    if (hasEditor()) tab.editorScroll = document.getElementById('editor').scrollTop;
-    if (hasPreview()) tab.previewScroll = document.getElementById('content').scrollTop;
+    if (hasEditor()) {{
+        var editor = document.getElementById('editor');
+        tab.editorScroll = editor.scrollTop;
+        tab.editorRatio = scrollRatio(editor);
+    }}
+    if (hasPreview()) {{
+        var content = document.getElementById('content');
+        tab.previewScroll = content.scrollTop;
+        tab.previewRatio = scrollRatio(content);
+    }}
+}}
+
+// Reading position is stored as a ratio so it survives edits, a resize, or a
+// different window size, and so a large document can be reopened where it was
+// left. Pixel offsets would be meaningless across those changes.
+function applyPendingScrollPositions(tab) {{
+    if (!tab) return;
+    if (hasPreview() && typeof tab.previewRatio === 'number') {{
+        applyScrollRatio(document.getElementById('content'), tab.previewRatio);
+    }}
+    if (hasEditor() && typeof tab.editorRatio === 'number') {{
+        applyScrollRatio(document.getElementById('editor'), tab.editorRatio);
+    }}
 }}
 
 document.getElementById('editor').addEventListener('input', function() {{
@@ -3688,7 +3953,7 @@ function scrollToRange(index) {{
     var rectangle = searchRanges[index].getBoundingClientRect();
     var contentRectangle = content.getBoundingClientRect();
     var target = content.scrollTop + (rectangle.top - contentRectangle.top) - (content.clientHeight - rectangle.height) / 2;
-    content.scrollTo({{ top: Math.max(0, target), behavior: 'smooth' }});
+    content.scrollTo({{ top: Math.max(0, target), behavior: scrollBehavior() }});
 }}
 
 function scrollToMatch(idx) {{
@@ -3967,6 +4232,18 @@ window.closeActiveTab = function() {{
 // Called from Python after the previous session's tabs have been reopened
 window.finishSessionRestore = function(state) {{
     if (!state || typeof state !== 'object') return;
+    var restoredPositions = false;
+    if (state.positions && typeof state.positions === 'object') {{
+        for (var i = 0; i < tabs.length; i++) {{
+            var tab = tabs[i];
+            if (!tab.path) continue;
+            var ratio = state.positions[tab.path];
+            if (typeof ratio === 'number' && ratio > 0) {{
+                tab.previewRatio = ratio;
+                restoredPositions = true;
+            }}
+        }}
+    }}
     if (typeof state.active === 'number' && state.active >= 0 && state.active < tabs.length) {{
         activeIdx = state.active;
         renderTabs();
@@ -3976,6 +4253,7 @@ window.finishSessionRestore = function(state) {{
     if (tabs.length > 0 && ['preview', 'edit', 'split'].indexOf(state.view_mode) >= 0) {{
         setViewMode(state.view_mode);
     }}
+    if (restoredPositions) renderActiveTab();
     syncSession();
 }};
 </script>
@@ -4593,7 +4871,11 @@ class PreviewApp:
         paths, active = plan_session_restore(self._session["tabs"], self._session["active"])
         for path in paths:
             self.load_file(path)
-        state = json.dumps({"active": active, "view_mode": self._session["view_mode"]})
+        state = json.dumps({
+            "active": active,
+            "view_mode": self._session["view_mode"],
+            "positions": self._session["positions"],
+        })
         try:
             self._window.evaluate_js(f"window.finishSessionRestore({state})")
         except Exception as error:

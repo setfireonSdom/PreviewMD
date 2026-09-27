@@ -1,3 +1,4 @@
+import codecs
 import json
 import tempfile
 import unittest
@@ -56,6 +57,25 @@ class DocumentDecodingTests(unittest.TestCase):
         with self.assertRaises(DocumentReadError) as context:
             decode_document(bytes(range(1, 200)))
         self.assertIn("编码", str(context.exception))
+
+    def test_utf16_with_a_byte_order_mark_is_read_not_mistaken_for_binary(self):
+        # Windows Notepad saves UTF-16, which is full of NUL bytes and used to be
+        # reported as "this looks like a binary file".
+        for bom, codec in ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be")):
+            with self.subTest(bom=bom):
+                text, detected = decode_document(bom + "第1章 标题".encode(codec))
+                self.assertEqual(detected, "utf-16")
+                self.assertIn("第1章", text)
+
+    def test_utf32_with_a_byte_order_mark_is_read(self):
+        text, detected = decode_document(codecs.BOM_UTF32_LE + "第1章".encode("utf-32-le"))
+        self.assertEqual(detected, "utf-32")
+        self.assertIn("第1章", text)
+
+    def test_real_binary_is_still_rejected(self):
+        with self.assertRaises(DocumentReadError) as context:
+            decode_document(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+        self.assertIn("二进制", str(context.exception))
 
     def test_document_read_error_is_an_os_error(self):
         # File-IO callers (session persistence) only catch OSError.

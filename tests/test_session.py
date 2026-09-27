@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -93,6 +94,28 @@ class SessionFileTests(unittest.TestCase):
 
         for broken in ("", "   ", 7, None, {"path": "/tmp"}):
             self.assertEqual(normalize_session({"last_directory": broken})["last_directory"], "")
+
+    def test_normalize_session_keeps_reading_positions_as_clamped_ratios(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            # Positions are keyed by resolved path, the same way open tabs are,
+            # so a reopened document finds its saved position.
+            resolved = os.path.realpath
+            session = normalize_session(
+                {
+                    "positions": {
+                        temporary_directory + "/a.txt": 0.4213,
+                        "/tmp/b.txt": 1.5,
+                        "/tmp/c.txt": -2,
+                    }
+                }
+            )
+            self.assertEqual(session["positions"][resolved(temporary_directory) + "/a.txt"], 0.4213)
+            self.assertEqual(session["positions"][resolved("/tmp/b.txt")], 1.0)
+            self.assertEqual(session["positions"][resolved("/tmp/c.txt")], 0.0)
+
+    def test_normalize_session_ignores_unusable_positions(self):
+        for broken in (None, [], "0.5", {7: 0.5}, {"/tmp/a.txt": "half"}, {"/tmp/b.txt": None}):
+            self.assertEqual(normalize_session({"positions": broken})["positions"], {})
 
     def test_persist_and_load_round_trip(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
