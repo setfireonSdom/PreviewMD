@@ -368,6 +368,67 @@ function wait(ms) {
 """
 
 
+ERROR_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+(async function () {
+    var results = {};
+    try {
+        var toast = document.getElementById("status-toast");
+        // Independent listener: how many error events actually arrive, and what
+        // do they say? Keeps this measurement separate from the app's own dedupe.
+        window.__RAW = [];
+        window.addEventListener("error", function(e) {
+            window.__RAW.push("error:" + (e && e.message ? e.message : "?"));
+        });
+        window.addEventListener("unhandledrejection", function(e) {
+            window.__RAW.push("rejection:" + (e && e.reason && e.reason.message ? e.reason.message : "?"));
+        });
+
+        // One throwing site, so a repeat really is the same failure repeating.
+        window.__THROW_SITE = function (message) { throw new Error(message); };
+
+        // An uncaught error must be reported once, on screen.
+        setTimeout(function() { window.__THROW_SITE("bench uncaught failure"); }, 0);
+        await wait(250);
+        results.reportedAfterUncaught = reportedErrorCount;
+        results.toastMentionsLog = toast.textContent.indexOf("previewmd.log") >= 0;
+        results.toastText = toast.textContent.slice(0, 60);
+
+        // The same error again must not repeat the notice.
+        setTimeout(function() { window.__THROW_SITE("bench uncaught failure"); }, 0);
+        await wait(250);
+        results.reportedAfterRepeat = reportedErrorCount;
+        results.suppressedAfterRepeat = suppressedErrorCount;
+
+        // A different error is a different problem and must be reported.
+        setTimeout(function() { window.__THROW_SITE("bench second failure"); }, 0);
+        await wait(250);
+        results.reportedAfterDifferent = reportedErrorCount;
+
+        // Rejections have to be caught too, not just thrown exceptions.
+        Promise.reject(new Error("bench unhandled rejection"));
+        await wait(250);
+        results.reportedAfterRejection = reportedErrorCount;
+
+        // The interface must still work after all of that.
+        results.rawEvents = window.__RAW;
+        results.stillRenders = document.getElementById("content") !== null;
+        showStatus("interface still alive");
+        results.toastStillWorks = toast.textContent === "interface still alive";
+    } catch (error) {
+        results.error = [error && error.name, error && error.message].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
 def synthetic_samples() -> dict[str, str]:
     paragraph = (
         "一般年轻的读者，一看这本书是文言文，也许会以为难得读懂，不感兴趣。"
@@ -469,6 +530,9 @@ def main() -> int:
     parser.add_argument(
         "--scroll", action="store_true", help="measure the per-frame cost of following the outline"
     )
+    parser.add_argument(
+        "--errors", action="store_true", help="verify global JavaScript error reporting"
+    )
     parser.add_argument("--json", action="store_true", help="print raw JSON")
     args = parser.parse_args()
 
@@ -496,6 +560,12 @@ def main() -> int:
     if args.position:
         sample = samples[next(iter(samples))]
         report = run_in_webview(build_page(sample, args.editor), POSITION_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.errors:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), ERROR_WORKLOAD)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 

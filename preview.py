@@ -13,12 +13,14 @@ import hashlib
 import base64
 import binascii
 import html
+import logging
 import re
 import stat
 import tempfile
 import threading
 import unicodedata
 import webbrowser
+from logging import handlers as logging_handlers
 from collections import OrderedDict
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
@@ -415,6 +417,92 @@ SESSION_VERSION = 1
 SESSION_VIEW_MODES = ("preview", "edit", "split")
 
 
+LOG_MAX_BYTES = 1024 * 1024
+LOG_BACKUP_COUNT = 3
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+LOGGER_NAME = "previewmd"
+log = logging.getLogger(LOGGER_NAME)
+
+
+def log_directory(env=None):
+    """Return the per-user log directory, following the macOS convention."""
+    environment = os.environ if env is None else env
+    override = environment.get("PREVIEWMD_LOG_DIR")
+    if override:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(override)))
+    if sys.platform == "darwin":
+        return os.fspath(Path.home() / "Library" / "Logs" / "PreviewMD")
+    state_home = environment.get("XDG_STATE_HOME")
+    base = Path(state_home) if state_home else Path.home() / ".local" / "state"
+    return os.fspath(base / "PreviewMD")
+
+
+def configure_logging(directory=None, level=logging.INFO):
+    """Send diagnostics to a rotating file.
+
+    Launched from Finder, a .app's stderr goes nowhere, so anything printed to
+    it is lost. A rotating file under ~/Library/Logs is what a bug report can
+    actually point at.
+
+    Document text must never be logged: only paths, sizes, and failures.
+    """
+    target = directory or log_directory()
+    try:
+        os.makedirs(target, exist_ok=True)
+        log_path = os.path.join(target, "previewmd.log")
+        for handler in list(log.handlers):
+            log.removeHandler(handler)
+            handler.close()
+        handler = logging_handlers.RotatingFileHandler(
+            log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        log.addHandler(handler)
+        # Keep stderr output too: running from a terminal is still useful, and
+        # a second handler costs nothing once the file exists.
+        log.addHandler(logging.StreamHandler(sys.stderr))
+        log.setLevel(level)
+        log.propagate = False
+        return log_path
+    except Exception as error:
+        # Logging must never be the reason the app fails to start.
+        logging.basicConfig(level=level, stream=sys.stderr)
+        sys.stderr.write(f"Could not open the PreviewMD log file: {error}\n")
+        return None
+
+
+def _webview_version():
+    """pywebview exposes no __version__; the installed distribution does."""
+    try:
+        import importlib.metadata as metadata
+
+        return metadata.version("pywebview")
+    except Exception:
+        return "unknown"
+
+
+def log_startup_banner(log_path):
+    """Record what a bug report needs: version, interpreter, and architecture."""
+    import platform
+
+    try:
+        from app_metadata import APP_VERSION
+
+        version = APP_VERSION
+    except Exception:
+        version = "unknown"
+    log.info(
+        "PreviewMD %s starting (python %s, %s, pywebview %s, %s)",
+        version,
+        sys.version.split()[0],
+        platform.machine(),
+        _webview_version(),
+        platform.platform(),
+    )
+    if log_path:
+        log.info("Log file: %s", log_path)
+
+
 def session_file_path(env=None):
     """Return the per-user session file, overridable for tests and packaging."""
     environment = os.environ if env is None else env
@@ -496,7 +584,7 @@ def persist_session(state, filepath=None):
         atomic_export_utf8(filepath, document)
         return True
     except OSError as error:
-        print(f"Could not store the session: {error}", file=sys.stderr)
+        log.warning("Could not store the session: %s", error)
         return False
 
 
@@ -2495,23 +2583,68 @@ function setEditorContent(content, preserveSelection) {{
 // ── Per-tab undo and redo ──
 var UNDO_SNAPSHOT_DELAY = 500;
 var UNDO_STACK_LIMIT = 200;
-var UNDO_STACK_MAX_CHARS = 2 * 1024 * 1024;
+// Undo keeps whole-document snapshots, so its budget has to scale with the
+// document. The flat 2 MB ceiling silently pinned long documents to a single
+// undo step: content.length is UTF-16 units, and a 2.1 million character novel
+// sits just past that limit, so every edit threw away the one before it.
+var UNDO_STACK_MIN_CHARS = 2 * 1024 * 1024;
+var UNDO_STACK_MAX_CHARS = 48 * 1024 * 1024;
+var UNDO_STACK_DOCUMENT_MULTIPLE = 4;
+// Two entries is the floor. A shallow history is an inconvenience; a history
+// that cannot reach past the last edit is a trap. Within the largest document
+// PreviewMD will open, the budget above always allows this many entries, so
+// the floor only guards against a future size limit change.
+var UNDO_STACK_MIN_ENTRIES = 2;
+
+function undoBudgetChars(documentLength) {{
+    if (typeof documentLength !== 'number' || !isFinite(documentLength) || documentLength <= 0) {{
+        return UNDO_STACK_MIN_CHARS;
+    }}
+    var budget = documentLength * UNDO_STACK_DOCUMENT_MULTIPLE;
+    if (budget < UNDO_STACK_MIN_CHARS) return UNDO_STACK_MIN_CHARS;
+    if (budget > UNDO_STACK_MAX_CHARS) return UNDO_STACK_MAX_CHARS;
+    return budget;
+}}
+
+function undoStepCount(tab) {{
+    return Math.max(0, tab.undoSteps || 0);
+}}
+
+function undoLimitNotice(tab) {{
+    var steps = Math.max(1, undoStepCount(tab));
+    return 'Undo history for this document (' + ((tab.content || '').length / 1e6).toFixed(1) +
+        'M characters) keeps only the last ' + steps + ' step' + (steps === 1 ? '' : 's') + '.';
+}}
 
 function resetUndoHistory(tab, content) {{
     clearTimeout(tab.undoTimer);
     tab.undoTimer = null;
     tab.undoStack = [];
     tab.redoStack = [];
+    tab.undoSteps = 0;
+    tab.undoDegraded = false;
     tab.undoBaseline = content;
 }}
 
 function trimUndoStack(tab) {{
     while (tab.undoStack.length > UNDO_STACK_LIMIT) tab.undoStack.shift();
+    var budget = undoBudgetChars((tab.content || '').length);
     var total = 0;
     for (var i = 0; i < tab.undoStack.length; i++) total += tab.undoStack[i].content.length;
-    while (tab.undoStack.length > 1 && total > UNDO_STACK_MAX_CHARS) {{
+    var trimmed = 0;
+    while (tab.undoStack.length > UNDO_STACK_MIN_ENTRIES && total > budget) {{
         total -= tab.undoStack.shift().content.length;
+        trimmed += 1;
     }}
+    tab.undoSteps = tab.undoStack.length;
+    if (trimmed > 0 && !tab.undoDegraded) {{
+        // Losing history used to be completely silent. Say it once, and keep
+        // saying it in the tab tooltip and on an empty undo.
+        tab.undoDegraded = true;
+        showStatus(undoLimitNotice(tab));
+        refreshTab(tab);
+    }}
+    return tab.undoSteps;
 }}
 
 function currentEditorSelection() {{
@@ -2571,8 +2704,12 @@ function undoEditor() {{
     if (activeIdx < 0 || activeIdx >= tabs.length) return false;
     var tab = tabs[activeIdx];
     commitUndoSnapshot(tab);
-    if (!tab.undoStack.length) return false;
+    if (!tab.undoStack.length) {{
+        showStatus(tab.undoDegraded ? undoLimitNotice(tab) : 'Nothing to undo in this tab.');
+        return false;
+    }}
     var entry = tab.undoStack.pop();
+    tab.undoSteps = tab.undoStack.length;
     tab.redoStack.push({{
         content: tab.content,
         start: currentEditorSelection().start,
@@ -2606,10 +2743,16 @@ function tabStateClass(tabState) {{
 }}
 
 function tabStateLabel(tabState) {{
-    if (tabState.conflict) return ', save conflict';
-    if (tabState.dirty) return ', unsaved changes';
-    if (tabState.externallyChanged) return ', changed on disk';
-    return ', saved';
+    var label;
+    if (tabState.conflict) label = ', save conflict';
+    else if (tabState.dirty) label = ', unsaved changes';
+    else if (tabState.externallyChanged) label = ', changed on disk';
+    else label = ', saved';
+    if (tabState.undoDegraded) {{
+        var steps = Math.max(1, undoStepCount(tabState));
+        label += ', undo limited to ' + steps + ' step' + (steps === 1 ? '' : 's');
+    }}
+    return label;
 }}
 
 function tabElement(tabState) {{
@@ -2828,7 +2971,8 @@ function addTab(name, path, content, diskHash) {{
         diskHash: diskHash || null,
         dirty: false, conflict: false, externallyChanged: false, externalContent: null,
         conflictVersion: 0, conflictBannerDismissed: false, saveTimer: null, savePromise: null, editorScroll: 0, previewScroll: 0,
-        imageCache: {{}}, undoStack: [], redoStack: [], undoTimer: null, undoBaseline: content
+        imageCache: {{}}, undoStack: [], redoStack: [], undoTimer: null, undoBaseline: content,
+        undoSteps: 0, undoDegraded: false
     }});
     activeIdx = tabs.length - 1;
 
@@ -3296,6 +3440,60 @@ window.addEventListener('beforeunload', function(event) {{
     event.preventDefault();
     event.returnValue = '';
     return '';
+}});
+
+// ── Global error reporting ──
+// Without these, a thrown error leaves a dead control with no explanation and
+// nothing to report. Surface it once on screen, and forward it to the log file
+// so a bug report has something to point at. The handler is wrapped because an
+// error inside the error handler must not loop.
+var reportedErrorCount = 0;
+var suppressedErrorCount = 0;
+var lastReportedError = '';
+var lastReportedErrorRepeats = 0;
+var REPORT_EVERY_REPEAT = 50;
+
+function reportPageError(kind, message, detail, location) {{
+    try {{
+        var text = String(message || 'Unknown error').slice(0, 400);
+        // Dedupe on where it happened, not only on what it said. A failing
+        // render loop must not flood the log, but two unrelated failures that
+        // happen to share a generic message are still two problems.
+        var key = kind + '|' + (location || '') + '|' + text;
+        if (key === lastReportedError) {{
+            suppressedErrorCount += 1;
+            lastReportedErrorRepeats += 1;
+            // Stay quiet, but not forever: a loop that runs for a minute is
+            // itself worth one more line.
+            if (lastReportedErrorRepeats % REPORT_EVERY_REPEAT !== 0) return;
+            text += ' (repeated ' + lastReportedErrorRepeats + ' times)';
+        }} else {{
+            lastReportedError = key;
+            lastReportedErrorRepeats = 0;
+        }}
+        reportedErrorCount += 1;
+        if (reportedErrorCount === 1) {{
+            showStatus('Something went wrong in the interface. Details are in ~/Library/Logs/PreviewMD/previewmd.log');
+        }}
+        callBridge('report_error', kind, text, String(detail || '').slice(0, 2000)).catch(function() {{}});
+    }} catch (ignored) {{
+        // Reporting an error must never raise another one.
+    }}
+}}
+
+window.addEventListener('error', function(event) {{
+    var message = event && event.message ? event.message : 'Unhandled error';
+    var location = event && event.filename ? event.filename + ':' + (event.lineno || 0) : '';
+    var detail = event && event.error && event.error.stack ? event.error.stack : '';
+    if (location) detail += (detail ? ' | ' : '') + 'at ' + location;
+    reportPageError('error', message, detail, location);
+}});
+
+window.addEventListener('unhandledrejection', function(event) {{
+    var reason = event && event.reason;
+    var message = reason && reason.message ? reason.message : String(reason || 'Unhandled rejection');
+    var detail = reason && reason.stack ? reason.stack : '';
+    reportPageError('unhandledrejection', message, detail, '');
 }});
 
 function toggleToc() {{
@@ -4279,7 +4477,7 @@ def build_application_menu(app):
             try:
                 app._window.evaluate_js(js_call)
             except Exception as error:
-                print(f"Menu action failed: {error}", file=sys.stderr)
+                log.exception("Menu action failed: %s", error)
         return action
 
     def open_document():
@@ -4346,6 +4544,22 @@ class Api:
         self._app._has_unsaved_changes = dirty is True
         return {"ok": True}
 
+    def report_error(self, kind, message, detail=""):
+        """Record a JavaScript error the page caught globally.
+
+        Only the message and the stack are stored. No document text is sent
+        here, and none is logged.
+        """
+        try:
+            log.error("Page %s: %s", str(kind)[:40], str(message)[:400])
+            if detail:
+                for line in str(detail).splitlines()[:20]:
+                    log.error("  %s", line[:300])
+        except Exception:
+            # The page is already in a bad state; never make it worse.
+            pass
+        return {"ok": True}
+
     def save_file(self, filepath, content, expected_hash, force=False):
         try:
             filepath = self._app._normalize_path(filepath)
@@ -4368,7 +4582,7 @@ class Api:
                 "error": "File changed on disk; autosave was cancelled.",
             }
         except Exception as e:
-            print(f"Error saving file: {e}", file=sys.stderr)
+            log.exception("Error saving file %s: %s", filepath, e)
             return {"ok": False, "error": f"Save failed: {e}"}
 
     def reload_file(self, filepath):
@@ -4385,7 +4599,7 @@ class Api:
         except FileNotFoundError:
             return {"ok": False, "missing": True, "error": "File no longer exists on disk."}
         except Exception as error:
-            print(f"Error reloading file: {error}", file=sys.stderr)
+            log.exception("Error reloading file %s: %s", filepath, error)
             return {"ok": False, "error": "File could not be read."}
         current_watcher = self._app._watchers.get(filepath)
         if current_watcher is not None and current_watcher["token"] == watcher["token"]:
@@ -4428,7 +4642,7 @@ class Api:
                 "hash": new_hash,
             }
         except Exception as error:
-            print(f"Error saving file as: {error}", file=sys.stderr)
+            log.exception("Error saving file as: %s", error)
             return {"ok": False, "error": f"Save failed: {error}"}
 
     def open_external_url(self, url):
@@ -4443,7 +4657,7 @@ class Api:
                 return {"ok": False, "error": "External URL has no host."}
             return {"ok": bool(webbrowser.open(value))}
         except Exception as error:
-            print(f"Error opening external URL: {error}", file=sys.stderr)
+            log.exception("Error opening external URL: %s", error)
             return {"ok": False, "error": "Could not open external URL."}
 
     def export_html(self, title, rendered_html, stylesheet):
@@ -4471,7 +4685,7 @@ class Api:
             atomic_export_utf8(selected_path, document)
             return {"ok": True}
         except Exception as error:
-            print(f"Error exporting HTML: {error}", file=sys.stderr)
+            log.exception("Error exporting HTML: %s", error)
             return {"ok": False, "error": f"Export failed: {error}"}
 
     def _open_document(self, document_path):
@@ -4500,7 +4714,7 @@ class Api:
         except ImageError as error:
             return {"ok": False, "error": str(error)}
         except Exception as error:
-            print(f"Error importing image: {error}", file=sys.stderr)
+            log.exception("Error importing image: %s", error)
             return {"ok": False, "error": "Image import failed."}
 
     def import_image_path(self, document_path, source_path):
@@ -4513,7 +4727,7 @@ class Api:
         except ImageError as error:
             return {"ok": False, "error": str(error)}
         except Exception as error:
-            print(f"Error importing dropped image: {error}", file=sys.stderr)
+            log.exception("Error importing dropped image: %s", error)
             return {"ok": False, "error": "Image import failed."}
 
     def import_image_data(self, document_path, filename, data_url):
@@ -4543,7 +4757,7 @@ class Api:
         except ImageError as error:
             return {"ok": False, "error": str(error)}
         except Exception as error:
-            print(f"Error importing pasted image: {error}", file=sys.stderr)
+            log.exception("Error importing pasted image: %s", error)
             return {"ok": False, "error": "Image import failed."}
 
     def resolve_image(self, document_path, source):
@@ -4558,7 +4772,7 @@ class Api:
         except ImageError as error:
             return {"ok": False, "error": str(error)}
         except Exception as error:
-            print(f"Error resolving image: {error}", file=sys.stderr)
+            log.exception("Error resolving image: %s", error)
             return {"ok": False, "error": "Image could not be resolved."}
 
 
@@ -4638,9 +4852,17 @@ class PreviewApp:
             self._show_ui_status(f"无法打开 {filename}：文件不存在。")
             return
         if encoding != DEFAULT_DOCUMENT_ENCODING:
+            log.info("Opened %s as %s; saving will convert it to UTF-8", filepath, encoding)
             self._show_ui_status(
                 f"{filename}：已按 {encoding} 解码打开；保存后会转为 UTF-8。"
             )
+        log.info(
+            "Opened %s (%s, %d characters, %s)",
+            filepath,
+            encoding,
+            len(content),
+            "utf-8" if encoding == DEFAULT_DOCUMENT_ENCODING else encoding,
+        )
 
         escaped_name = json.dumps(filename)
         escaped_path = json.dumps(filepath)
@@ -4735,7 +4957,7 @@ class PreviewApp:
         try:
             observer.remove_handler_for_watch(watcher["handler"], directory_entry["watch"])
         except Exception as error:
-            print(f"Could not detach watcher for {filepath}: {error}", file=sys.stderr)
+            log.warning("Could not detach watcher for %s: %s", filepath, error)
         directory_entry["count"] -= 1
         if directory_entry["count"] > 0:
             return
@@ -4743,7 +4965,7 @@ class PreviewApp:
         try:
             observer.unschedule(directory_entry["watch"])
         except Exception as error:
-            print(f"Could not stop watching {watched_dir}: {error}", file=sys.stderr)
+            log.warning("Could not stop watching %s: %s", watched_dir, error)
 
     def save_document(self, filepath, content, replaced_path=None):
         """Write a user-confirmed path and make it an auto-saving document."""
@@ -4839,7 +5061,7 @@ class PreviewApp:
             body.on("drop", DOMEventHandler(self.handle_native_drop, prevent_default=True))
             self._window.evaluate_js("window.previewmdNativeDropReady = true")
         except Exception as error:
-            print(f"Native file drop is unavailable: {error}", file=sys.stderr)
+            log.warning("Native file drop is unavailable: %s", error)
 
     def _on_loaded(self):
         """Open the CLI file, a file:// URL, or the previous session's tabs."""
@@ -4879,12 +5101,14 @@ class PreviewApp:
         try:
             self._window.evaluate_js(f"window.finishSessionRestore({state})")
         except Exception as error:
-            print(f"Could not restore the previous session: {error}", file=sys.stderr)
+            log.exception("Could not restore the previous session: %s", error)
 
     def _on_closing(self):
         """Cancel native close unless the user confirms discarding unsaved work."""
         if not self._has_unsaved_changes:
+            log.info("Window closing with no unsaved changes")
             return True
+        log.info("Window closing with unsaved changes; asking for confirmation")
         try:
             return bool(self._window.create_confirmation_dialog(
                 "Unsaved Changes",
@@ -4892,11 +5116,12 @@ class PreviewApp:
                 "Close the window and discard them?",
             ))
         except Exception as error:
-            print(f"Error showing close confirmation: {error}", file=sys.stderr)
+            log.exception("Error showing close confirmation: %s", error)
             return False
 
     def run(self, filepaths=None):
         self._pending_files = list(filepaths or [])
+        log.info("Opening %d file(s) from the command line", len(self._pending_files))
         html = build_html()
         window_options = {
             "html": html,
@@ -4908,12 +5133,20 @@ class PreviewApp:
         }
         try:
             self._window = webview.create_window("PreviewMD", menu=build_application_menu(self), **window_options)
+            log.info(
+                "Window created at %sx%s (min %sx%s)",
+                window_options["width"],
+                window_options["height"],
+                window_options["min_size"][0],
+                window_options["min_size"][1],
+            )
             webview.start(debug=False)
+            log.info("Webview loop finished")
         except Exception as error:
             # A menu problem must never stop the app from starting. pywebview
             # builds the native menu inside start(), so the retry has to wrap
             # both calls.
-            print(f"Custom menu unavailable ({error}); retrying without it.", file=sys.stderr)
+            log.warning("Custom menu unavailable (%s); retrying without it.", error)
             self._window = webview.create_window("PreviewMD", **window_options)
             webview.start(debug=False)
         self._window.events.loaded += self._on_loaded
@@ -4937,15 +5170,18 @@ class PreviewApp:
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
+    # Configure logging before anything can fail: the argument checks below and
+    # the webview startup are exactly the steps a bug report needs to describe.
+    log_startup_banner(configure_logging())
     filepaths = []
     for candidate in sys.argv[1:]:
         if candidate.startswith("-"):
             continue
         if not os.path.isfile(candidate):
-            print(f"File not found: {candidate}", file=sys.stderr)
+            log.warning("File not found: %s", candidate)
             sys.exit(1)
         if not candidate.lower().endswith((".md", ".txt")):
-            print(f"Not a Markdown or text file: {candidate}", file=sys.stderr)
+            log.warning("Not a Markdown or text file: %s", candidate)
             sys.exit(1)
         filepaths.append(candidate)
 
