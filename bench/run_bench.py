@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -537,6 +538,130 @@ function round2(value) {
 """
 
 
+DRAFT_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+(async function () {
+    var results = {};
+    try {
+        // Two drafts, one of them the active tab, typed into by hand.
+        newUntitledTab();
+        tabs[0].name = "notes.md";
+        tabs[0].content = "# 草稿一\n\n还没保存的想法。";
+        tabs[0].dirty = true;
+        captureActiveScrolls();
+        newUntitledTab();
+        tabs[1].name = "outline.md";
+        tabs[1].content = "# 草稿二\n\n第二份未保存内容。";
+        tabs[1].dirty = true;
+        captureActiveScrolls();
+
+        var state = sessionState();
+        results.draftCount = state.drafts.length;
+        results.draftNames = state.drafts.map(function(d) { return d.name; });
+        results.activeDraft = state.active_draft;
+        results.fileTabs = state.tabs.length;
+
+        // Simulate a restart: throw the tabs away and replay the session.
+        var replay = JSON.parse(JSON.stringify(state));
+        tabs.splice(0, tabs.length);
+        activeIdx = -1;
+        document.getElementById("content").replaceChildren();
+        window.finishSessionRestore(replay);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(120);
+
+        results.restoredCount = tabs.length;
+        results.restoredNames = tabs.map(function(t) { return t.name; });
+        results.restoredContent = tabs.map(function(t) { return t.content.slice(0, 12); });
+        results.activeName = tabs[activeIdx] ? tabs[activeIdx].name : null;
+        results.activeHasNoPath = tabs[activeIdx] ? !tabs[activeIdx].path : false;
+        results.activeDirty = tabs[activeIdx] ? tabs[activeIdx].dirty : false;
+        // This is the gate on the close confirmation: if it is false, quitting
+        // discards the restored draft without asking.
+        results.unsavedWorkReported = hasUnsavedWork();
+        results.closeWouldWarn = hasUnsavedWork();
+        results.renderedHeading = document.querySelector("#content h1") ?
+            document.querySelector("#content h1").textContent : null;
+    } catch (error) {
+        results.error = [error && error.name, error && error.message, error && error.stack].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
+FONT_SIZE_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+(async function () {
+    var results = {};
+    try {
+        window.addTabFromPython("a.md", null, "# 标题\n\n正文内容，用来测量字号。", null);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(80);
+        setViewMode("split");
+        await wait(120);
+
+        results.buttons = document.querySelectorAll("#settings-sizes button").length;
+        var measured = {};
+        ["small", "default", "large", "huge"].forEach(function(key) {
+            setFontSize(key);
+            var content = document.getElementById("content");
+            var editor = document.getElementById("editor");
+            measured[key] = {
+                content: Math.round(parseFloat(getComputedStyle(content).fontSize)),
+                editor: Math.round(parseFloat(getComputedStyle(editor).fontSize)),
+                checked: document.querySelector('#settings-sizes button[aria-checked="true"]').dataset.sizeKey
+            };
+        });
+        results.measured = measured;
+
+        // Content must grow monotonically, and both panes must move together.
+        var order = ["small", "default", "large", "huge"].map(function(k) { return measured[k].content; });
+        results.contentAscending = order[0] < order[1] && order[1] < order[2] && order[2] < order[3];
+        results.editorAscending = (function() {
+            var e = ["small", "default", "large", "huge"].map(function(k) { return measured[k].editor; });
+            return e[0] < e[1] && e[1] < e[2] && e[2] < e[3];
+        })();
+        results.checkmarksFollow = ["small", "default", "large", "huge"].every(function(k) {
+            return measured[k].checked === k;
+        });
+
+        // The menu opens, and Escape closes it.
+        document.getElementById("tab-settings").click();
+        results.menuOpens = document.getElementById("settings-menu").classList.contains("open");
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        results.menuClosesOnEscape = !document.getElementById("settings-menu").classList.contains("open");
+
+        // The editor highlight mirror must not disagree with the editor.
+        setFontSize("large");
+        document.getElementById("search-input").style.display = "block";
+        openSearch();
+        document.getElementById("search-input").value = "正文";
+        doSearch();
+        var layer = document.getElementById("editor-highlights");
+        results.mirrorFontSize = Math.round(parseFloat(getComputedStyle(layer).fontSize));
+        results.editorFontSize = Math.round(parseFloat(getComputedStyle(document.getElementById("editor")).fontSize));
+        results.mirrorMatchesEditor = results.mirrorFontSize === results.editorFontSize;
+    } catch (error) {
+        results.error = [error && error.name, error && error.message].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
 def synthetic_samples() -> dict[str, str]:
     paragraph = (
         "一般年轻的读者，一看这本书是文言文，也许会以为难得读懂，不感兴趣。"
@@ -621,6 +746,54 @@ def build_page(document: str, force_editor: bool = False) -> str:
     return build_html().replace("</body>", injection, 1)
 
 
+# ── Repeated measurement ──
+# There is no timing gate here, and the reason is measured rather than assumed.
+# On this machine a single run of identical code varied by 2.4 to 2.8 times
+# (first paint 50..118 ms, full render 285..800 ms), and the median of five runs
+# still moved by up to 2.2 times between two independent batches. A threshold
+# loose enough to tolerate that spread would also tolerate a real regression, and
+# a tighter one would fail every day. A gate nobody can trust gets switched off.
+#
+# So this only reports. Comparing a change against the previous build is worth
+# doing, but do it the way the outline fix was verified: run both versions
+# alternately in one session, which cancels machine drift. Structural invariants
+# (the layout-read count in test_outline_lookup_cost, undo depth in
+# test_undo_history) are deterministic and belong in the test suite instead.
+# The samples worth repeating a measurement on: the longest plain document, the
+# heaviest KaTeX document, and the heading-heavy one.
+REPEAT_SAMPLES = ("plain_long", "many_formulas", "many_headings")
+REPEAT_METRICS = ("first_paint_ms", "full_render_ms")
+REPEAT_DEFAULT_RUNS = 5
+
+
+def run_repeats(args, samples):
+    """Measure the interesting samples several times and report median and spread."""
+    runs = args.repeat if args.repeat else REPEAT_DEFAULT_RUNS
+    collected = {name: {"first_paint_ms": [], "full_render_ms": []} for name in REPEAT_SAMPLES}
+
+    for _ in range(runs):
+        for name in REPEAT_SAMPLES:
+            result = run_in_webview(build_page(samples[name], args.editor), WORKLOAD)
+            collected[name]["first_paint_ms"].append(result["firstPaintMs"])
+            collected[name]["full_render_ms"].append(result["fullRenderMs"])
+
+    print(f"{'sample':16} {'metric':16} {'runs':>14} {'median':>9} {'spread':>8}")
+    for name, metrics in collected.items():
+        for metric in REPEAT_METRICS:
+            values = sorted(metrics[metric])
+            median = statistics.median(values)
+            spread = values[-1] / values[0] if values[0] else 0
+            print(
+                f"{name:16} {metric:16} "
+                f"{values[0]:>6.0f}..{values[-1]:<7.0f} {median:>8.0f}ms {spread:>7.1f}x"
+            )
+    print(
+        "\nCompare by running the previous build the same way and alternating the two.\n"
+        "A single number from a single run means nothing on this machine."
+    )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sample", nargs="?", help="synthetic sample name")
@@ -643,6 +816,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--toc-build", action="store_true", help="measure what building the outline costs"
+    )
+    parser.add_argument(
+        "--drafts", action="store_true", help="verify unsaved drafts survive a restart"
+    )
+    parser.add_argument(
+        "--font-size", action="store_true", help="verify the reading size control"
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=0,
+        metavar="N",
+        help="measure the key samples N times and report median and spread",
     )
     parser.add_argument("--json", action="store_true", help="print raw JSON")
     args = parser.parse_args()
@@ -686,11 +872,26 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 
+    if args.font_size:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), FONT_SIZE_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.drafts:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), DRAFT_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
     if args.scroll:
         sample = samples[next(iter(samples))]
         report = run_in_webview(build_page(sample, args.editor), SCROLL_WORKLOAD)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
+
+    if args.repeat:
+        return run_repeats(args, samples)
 
     report = {}
     for name, document in samples.items():

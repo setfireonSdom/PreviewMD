@@ -104,7 +104,8 @@ class ReadingPositionTests(unittest.TestCase):
             self.assertIn(marker, self.document)
 
     def test_the_session_payload_carries_positions(self):
-        self.assertIn("view_mode: viewMode, positions: positions", self.document)
+        self.assertIn("view_mode: viewMode,", self.document)
+        self.assertIn("positions: positions", self.document)
         self.assertIn("state.positions[tab.path]", self.document)
 
     def test_position_is_applied_after_a_progressive_render_finishes(self):

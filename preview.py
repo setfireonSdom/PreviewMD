@@ -349,6 +349,41 @@ def watched_file_signature(filepath):
     return (file_stat.st_mtime_ns, file_stat.st_size)
 
 
+def describe_save_error(error, filepath):
+    """Turn an OS error into something a reader can act on.
+
+    The raw strerror names the internal temporary file
+    (".note.md.2t8kozk5.tmp"), which the user has never seen and cannot do
+    anything about. Permission problems also have an obvious next step, so say
+    which one it is and name it.
+    """
+    import errno as errno_module
+
+    name = os.path.basename(filepath)
+    folder = os.path.dirname(filepath) or "that folder"
+    if isinstance(error, OSError) and error.errno is not None:
+        code = error.errno
+        if code in (errno_module.EACCES, errno_module.EPERM):
+            return f"Permission denied writing to {folder}. Try Save As to choose another location."
+        if code == errno_module.EROFS:
+            return f"{folder} is on a read-only disk. Try Save As to choose another location."
+        if code == errno_module.ENOSPC:
+            return "There is no space left on that disk. Free some space, or use Save As."
+        if code == errno_module.EDQUOT:
+            return f"There is no space left on the quota for {folder}. Use Save As."
+        if code == errno_module.EISDIR:
+            return f"{name} is a folder, not a file. Use Save As to choose a different name."
+        if code == errno_module.ENOENT:
+            return f"The folder for {name} no longer exists. Use Save As to choose a location."
+        if code == errno_module.ENAMETOOLONG:
+            return f"The name for {name} is too long for that folder. Use Save As to shorten it."
+        if code == errno_module.EMLINK:
+            return f"Too many links to {name}; the file may be a hard link. Use Save As."
+        # Anything else: keep the system wording but never leak the temp name.
+        return f"Could not write {name}: {error.strerror or error}."
+    return f"Could not save {name}. See ~/Library/Logs/PreviewMD/previewmd.log for details."
+
+
 def atomic_write_utf8(filepath, content, expected_hash=None, force=False, replace=os.replace):
     """Optimistically and atomically replace a UTF-8 text file in its directory."""
     filepath = os.path.realpath(os.path.abspath(filepath))
@@ -415,7 +450,13 @@ def atomic_export_utf8(filepath, content, replace=os.replace):
 
 # ─── Session persistence ─────────────────────────────────────────────────────
 
-SESSION_VERSION = 1
+SESSION_VERSION = 2
+# A draft is an unsaved document held only in this window. A file-backed tab is
+# autosaved within a second, so a draft is the one thing a crash can destroy, and
+# that is why it is written to the session. Very large drafts are skipped: at
+# that size the text belongs in a file, and the session file is not a document
+# store.
+MAX_SESSION_DRAFT_CHARS = 1024 * 1024
 SESSION_VIEW_MODES = ("preview", "edit", "split")
 
 
@@ -520,6 +561,70 @@ def session_file_path(env=None):
     return os.fspath(base_dir / "session.json")
 
 
+SETTINGS_VERSION = 1
+FONT_SIZE_KEYS = ("small", "default", "large", "huge")
+
+
+def settings_file_path(env=None):
+    """Return the preferences file.
+
+    Deliberately not part of session.json: the session is only restored when
+    PreviewMD starts with no files, so a preference stored there would be
+    ignored every time a document is opened from Finder.
+    """
+    environment = os.environ if env is None else env
+    override = environment.get("PREVIEWMD_SETTINGS_FILE")
+    if override:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(override)))
+    if sys.platform == "darwin":
+        base_dir = Path.home() / "Library" / "Application Support" / "PreviewMD"
+    else:
+        state_home = environment.get("XDG_STATE_HOME")
+        base = Path(state_home) if state_home else Path.home() / ".local" / "state"
+        base_dir = base / "PreviewMD"
+    return os.fspath(base_dir / "settings.json")
+
+
+def normalize_settings(payload):
+    """Reduce arbitrary input to known preferences with usable defaults."""
+    settings = {"version": SETTINGS_VERSION, "font_size": "default"}
+    if not isinstance(payload, dict):
+        return settings
+    if payload.get("font_size") in FONT_SIZE_KEYS:
+        settings["font_size"] = payload["font_size"]
+    return settings
+
+
+def load_settings(path=None):
+    target = path or settings_file_path()
+    try:
+        with open(target, encoding="utf-8") as handle:
+            return normalize_settings(json.load(handle))
+    except (OSError, ValueError):
+        return normalize_settings(None)
+
+
+def store_settings(settings, path=None):
+    target = path or settings_file_path()
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            json.dump(normalize_settings(settings), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        return True
+    except OSError as error:
+        log.warning("Could not store settings: %s", error)
+        return False
+
+
+def _clamp_ratio(value):
+    """Accept a stored scroll ratio, or 0 when it is missing or nonsense."""
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def normalize_session(payload):
     """Reduce arbitrary input to an openable tab list plus the active index."""
     session = {
@@ -529,6 +634,8 @@ def normalize_session(payload):
         "view_mode": "preview",
         "last_directory": "",
         "positions": {},
+        "drafts": [],
+        "active_draft": None,
     }
     if not isinstance(payload, dict):
         return session
@@ -552,6 +659,33 @@ def normalize_session(payload):
         session["last_directory"] = os.path.realpath(
             os.path.abspath(os.path.expanduser(raw_directory))
         )
+    raw_drafts = payload.get("drafts")
+    if isinstance(raw_drafts, list):
+        for item in raw_drafts:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            name = item.get("name")
+            if not isinstance(content, str) or not content:
+                continue
+            if len(content) > MAX_SESSION_DRAFT_CHARS:
+                log.warning("Skipped a stored draft over the size limit: %s", name or "Untitled")
+                continue
+            if not isinstance(name, str) or not name.strip():
+                name = "Untitled.md"
+            elif not name.lower().endswith((".md", ".txt")):
+                name = ensure_document_extension(name)
+            session["drafts"].append({
+                "name": name,
+                "content": content,
+                "preview_ratio": _clamp_ratio(item.get("preview_ratio")),
+                "editor_ratio": _clamp_ratio(item.get("editor_ratio")),
+            })
+    raw_active_draft = payload.get("active_draft")
+    if isinstance(raw_active_draft, str) and any(
+        draft["name"] == raw_active_draft for draft in session["drafts"]
+    ):
+        session["active_draft"] = raw_active_draft
     raw_positions = payload.get("positions")
     if isinstance(raw_positions, dict):
         for path, ratio in raw_positions.items():
@@ -944,7 +1078,7 @@ body.has-tabs #tab-bar {{ display: flex; }}
     cursor: default;
 }}
 
-#export-wrap {{ position: relative; flex-shrink: 0; }}
+#export-wrap, #settings-wrap {{ position: relative; flex-shrink: 0; }}
 #export-menu {{
     display: none;
     position: fixed;
@@ -1038,7 +1172,7 @@ textarea:focus-visible, .tab:focus-visible {{
     background: transparent;
     color: var(--text);
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 15px;
+    font-size: var(--editor-font-size, 15px);
     line-height: 1.7;
     padding: 16px 0;
     box-sizing: border-box;
@@ -1228,6 +1362,43 @@ body.has-tabs #workspace {{ display: flex; }}
     z-index: 15;
 }}
 body.toc-open #toc-sidebar {{ display: block; }}
+#settings-menu {{
+    position: absolute;
+    z-index: 40;
+    min-width: 168px;
+    padding: 4px;
+    background: var(--panel-bg, var(--bg));
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+    display: none;
+}}
+#settings-menu.open {{ display: block; }}
+#settings-menu .settings-label {{
+    padding: 5px 8px 3px;
+    font-size: 11px;
+    color: var(--dropzone-text);
+}}
+#settings-menu button[role="menuitemradio"] {{
+    display: flex;
+    width: 100%;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 5px 8px;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+}}
+#settings-menu button[role="menuitemradio"]:hover {{ background: var(--tab-hover-bg); }}
+#settings-menu button[aria-checked="true"] {{ color: var(--accent); font-weight: 600; }}
+#settings-menu .size-glyph {{ font-size: 13px; }}
+
 #toc-title {{ margin: 0 8px 9px; font-size: 12px; font-weight: 650; color: var(--dropzone-text); }}
 #toc-progress {{
     margin: -4px 8px 9px;
@@ -1334,6 +1505,9 @@ body.has-tabs #dropzone {{ display: none; }}
     height: 100%;
     overflow-y: auto;
     line-height: 1.6;
+    /* Reading size. The first thing a reader asks for, and until now it was
+       hardcoded, so the only way to change it was to edit the source. */
+    font-size: var(--reader-font-size, 16px);
 }}
 body.split-mode #editor-wrap {{ display: block; flex: 1 1 50%; }}
 body.split-mode #content {{ flex: 1 1 50%; }}
@@ -1546,6 +1720,15 @@ body.edit-mode #content {{ display: none; }}
       <button type="button" role="menuitem" onclick="saveFileAs()">Save As...</button>
       <button type="button" role="menuitem" onclick="exportHtml()">Export HTML...</button>
       <button type="button" role="menuitem" onclick="printDocument()">Print / Save as PDF...</button>
+    </div>
+  </div>
+  <div id="settings-wrap">
+    <button id="tab-settings" onclick="toggleSettingsMenu(event)" title="Reading size" aria-label="Reading size" aria-haspopup="menu" aria-expanded="false">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12.5 6 9l2.5 2.5L13 6.5"/><path d="M10.5 6.5H13V9"/></svg>
+    </button>
+    <div id="settings-menu" role="menu" aria-label="Reading size">
+      <div class="settings-label" id="settings-size-label">Text size</div>
+      <div id="settings-sizes" role="group" aria-labelledby="settings-size-label"></div>
     </div>
   </div>
   <div class="toolbar-sep" aria-hidden="true"></div>
@@ -2095,16 +2278,36 @@ function sessionState() {{
     var paths = [];
     var active = 0;
     var positions = {{}};
+    var drafts = [];
+    var activeDraft = null;
     for (var i = 0; i < tabs.length; i++) {{
         var tab = tabs[i];
-        if (!tab.path) continue;
+        if (!tab.path) {{
+            // An unsaved document exists only in this window. Writing it into the
+            // session is the only thing standing between a crash and losing it.
+            if (i === activeIdx) activeDraft = tab.name;
+            drafts.push({{
+                name: tab.name,
+                content: tab.content,
+                preview_ratio: typeof tab.previewRatio === 'number' ? tab.previewRatio : 0,
+                editor_ratio: typeof tab.editorRatio === 'number' ? tab.editorRatio : 0
+            }});
+            continue;
+        }}
         if (i <= activeIdx) active = paths.length;
         paths.push(tab.path);
         if (typeof tab.previewRatio === 'number' && tab.previewRatio > 0) {{
             positions[tab.path] = Math.round(tab.previewRatio * 10000) / 10000;
         }}
     }}
-    return {{ tabs: paths, active: active, view_mode: viewMode, positions: positions }};
+    return {{
+        tabs: paths,
+        drafts: drafts,
+        active_draft: activeDraft,
+        active: active,
+        view_mode: viewMode,
+        positions: positions
+    }};
 }}
 
 function syncSession() {{
@@ -3558,6 +3761,107 @@ function closeExportMenu() {{
     document.getElementById('tab-export').setAttribute('aria-expanded', 'false');
 }}
 
+// ── Reading size ──
+// Four steps rather than a free-form number: a reader who wants "bigger" should
+// not have to know what a pixel value is, and the editor stays legible at every
+// step. Applied through CSS variables so the editor mirror picks it up too.
+var FONT_SIZE_STEPS = [
+    {{ key: 'small', preview: 13, content: 14, editor: 13, glyph: 'A', label: 'Small' }},
+    {{ key: 'default', preview: 16, content: 16, editor: 15, glyph: 'A', label: 'Default' }},
+    {{ key: 'large', preview: 19, content: 19, editor: 18, glyph: 'A', label: 'Large' }},
+    {{ key: 'huge', preview: 23, content: 22, editor: 21, glyph: 'A', label: 'Huge' }}
+];
+var fontSizeKey = 'default';
+
+function fontSizeStep() {{
+    for (var i = 0; i < FONT_SIZE_STEPS.length; i++) {{
+        if (FONT_SIZE_STEPS[i].key === fontSizeKey) return FONT_SIZE_STEPS[i];
+    }}
+    return FONT_SIZE_STEPS[1];
+}}
+
+function applyFontSize() {{
+    var step = fontSizeStep();
+    var root = document.documentElement;
+    root.style.setProperty('--reader-font-size', step.content + 'px');
+    root.style.setProperty('--editor-font-size', step.editor + 'px');
+    syncFontSizeMenu();
+    // The editor highlight mirror copies computed styles once per text change,
+    // so it has to be told to re-measure or the two panes disagree.
+    editorLayerText = null;
+    if (isSearchOpen()) renderEditorHighlights();
+}}
+
+function setFontSize(key) {{
+    if (fontSizeKey === key) return;
+    fontSizeKey = key;
+    applyFontSize();
+    callBridge('save_settings', {{ font_size: key }}).catch(function() {{}});
+    showStatus('Text size: ' + fontSizeStep().label);
+}}
+
+function initReadingSize(settings) {{
+    if (settings && typeof settings.font_size === 'string') {{
+        var known = FONT_SIZE_STEPS.some(function(step) {{ return step.key === settings.font_size; }});
+        if (known) fontSizeKey = settings.font_size;
+    }}
+    buildFontSizeMenu();
+    applyFontSize();
+}}
+
+function buildFontSizeMenu() {{
+    var host = document.getElementById('settings-sizes');
+    if (!host || host.childElementCount) return;
+    FONT_SIZE_STEPS.forEach(function(step, index) {{
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.setAttribute('role', 'menuitemradio');
+        button.dataset.sizeKey = step.key;
+        var glyph = document.createElement('span');
+        glyph.className = 'size-glyph';
+        glyph.style.fontSize = (10 + index * 2) + 'px';
+        glyph.textContent = step.glyph;
+        var label = document.createElement('span');
+        label.textContent = step.label;
+        button.appendChild(glyph);
+        button.appendChild(label);
+        button.onclick = function() {{ setFontSize(step.key); }};
+        host.appendChild(button);
+    }});
+}}
+
+function syncFontSizeMenu() {{
+    Array.prototype.forEach.call(
+        document.querySelectorAll('#settings-sizes button'),
+        function(button) {{ button.setAttribute('aria-checked', String(button.dataset.sizeKey === fontSizeKey)); }}
+    );
+}}
+
+function closeSettingsMenu() {{
+    var menu = document.getElementById('settings-menu');
+    if (!menu) return;
+    menu.classList.remove('open');
+    document.getElementById('tab-settings').setAttribute('aria-expanded', 'false');
+}}
+
+function toggleSettingsMenu(event) {{
+    if (event) event.stopPropagation();
+    var menu = document.getElementById('settings-menu');
+    var opening = !menu.classList.contains('open');
+    closeSettingsMenu();
+    closeExportMenu();
+    if (opening) {{
+        var button = document.getElementById('tab-settings');
+        var rect = button.getBoundingClientRect();
+        menu.style.top = (rect.bottom + 4) + 'px';
+        menu.style.left = Math.max(6, rect.left - 40) + 'px';
+        menu.classList.add('open');
+        button.setAttribute('aria-expanded', 'true');
+        syncFontSizeMenu();
+        menu.querySelector('button').focus();
+    }}
+}}
+
 function toggleExportMenu(event) {{
     if (event) event.stopPropagation();
     var menu = document.getElementById('export-menu');
@@ -3575,6 +3879,7 @@ function toggleExportMenu(event) {{
 }}
 document.addEventListener('click', function(event) {{
     if (!document.getElementById('export-wrap').contains(event.target)) closeExportMenu();
+    if (!document.getElementById('settings-wrap').contains(event.target)) closeSettingsMenu();
 }});
 
 async function awaitStableExportRender(tab) {{
@@ -4323,6 +4628,11 @@ document.addEventListener('keydown', function(e) {{
             closeLightbox();
             return;
         }}
+        if (document.getElementById('settings-menu').classList.contains('open')) {{
+            closeSettingsMenu();
+            document.getElementById('tab-settings').focus();
+            return;
+        }}
         if (document.getElementById('export-menu').classList.contains('open')) {{
             closeExportMenu();
             document.getElementById('tab-export').focus();
@@ -4476,10 +4786,33 @@ window.closeActiveTab = function() {{
     if (activeIdx >= 0) return closeTab(activeIdx);
 }};
 
+// Reading size, applied once everything it touches exists. Called at the end of
+// this script on purpose: FONT_SIZE_STEPS is declared further down, and `var`
+// hoists the declaration but not the assignment, so calling this earlier threw
+// on an undefined list and silently stopped the rest of this block.
+initReadingSize(window.previewmdSettings);
+
 // Called from Python after the previous session's tabs have been reopened
 window.finishSessionRestore = function(state) {{
     if (!state || typeof state !== 'object') return;
     var restoredPositions = false;
+    var draftTab = null;
+    if (Array.isArray(state.drafts)) {{
+        state.drafts.forEach(function(draft) {{
+            if (!draft || typeof draft.content !== 'string') return;
+            addTab(draft.name || 'Untitled.md', null, draft.content, null);
+            var tab = tabs[tabs.length - 1];
+            // A restored draft is unsaved work. Without this the tab reads as
+            // saved, hasUnsavedWork() returns false, and closing the window
+            // discards the draft without ever asking.
+            tab.savedContent = '';
+            tab.dirty = tab.content !== '';
+            if (typeof draft.preview_ratio === 'number') tab.previewRatio = draft.preview_ratio;
+            if (typeof draft.editor_ratio === 'number') tab.editorRatio = draft.editor_ratio;
+            if (draft.name === state.active_draft) draftTab = tab;
+            refreshTab(tab);
+        }});
+    }}
     if (state.positions && typeof state.positions === 'object') {{
         for (var i = 0; i < tabs.length; i++) {{
             var tab = tabs[i];
@@ -4500,7 +4833,14 @@ window.finishSessionRestore = function(state) {{
     if (tabs.length > 0 && ['preview', 'edit', 'split'].indexOf(state.view_mode) >= 0) {{
         setViewMode(state.view_mode);
     }}
-    if (restoredPositions) renderActiveTab();
+    if (draftTab) {{
+        activeIdx = tabs.indexOf(draftTab);
+        renderTabs();
+        renderActiveTab();
+        syncWindowTitle();
+    }} else if (restoredPositions) {{
+        renderActiveTab();
+    }}
     syncSession();
 }};
 </script>
@@ -4593,6 +4933,15 @@ class Api:
         self._app._has_unsaved_changes = dirty is True
         return {"ok": True}
 
+    def save_settings(self, settings):
+        """Persist reading preferences. Never fails the caller: a preference
+        that could not be stored is still applied for this session."""
+        if not isinstance(settings, dict):
+            return {"ok": False, "error": "Invalid settings."}
+        stored = store_settings({**self._app._settings, **settings})
+        self._app._settings = normalize_settings({**self._app._settings, **settings})
+        return {"ok": True, "saved": stored}
+
     def report_error(self, kind, message, detail=""):
         """Record a JavaScript error the page caught globally.
 
@@ -4631,8 +4980,10 @@ class Api:
                 "error": "File changed on disk; autosave was cancelled.",
             }
         except Exception as e:
+            # The log keeps the raw traceback; the user gets wording they can act
+            # on. The traceback is the only place the temp path is needed.
             log.exception("Error saving file %s: %s", filepath, e)
-            return {"ok": False, "error": f"Save failed: {e}"}
+            return {"ok": False, "error": describe_save_error(e, filepath), "retry_as": "save_as"}
 
     def reload_file(self, filepath):
         """Read a watched file from disk for an explicit reload request."""
@@ -4838,6 +5189,7 @@ class PreviewApp:
         self._has_unsaved_changes = False
         self._session_path = session_path or session_file_path()
         self._session = load_session(self._session_path)
+        self._settings = load_settings()
         self._last_directory = self._session["last_directory"]
         self._image_cache = OrderedDict()
         self._image_cache_bytes = 0
@@ -5146,7 +5498,11 @@ class PreviewApp:
             "active": active,
             "view_mode": self._session["view_mode"],
             "positions": self._session["positions"],
+            "drafts": self._session["drafts"],
+            "active_draft": self._session["active_draft"],
         })
+        if self._session["drafts"]:
+            log.info("Restoring %d unsaved draft(s)", len(self._session["drafts"]))
         try:
             self._window.evaluate_js(f"window.finishSessionRestore({state})")
         except Exception as error:
@@ -5171,7 +5527,13 @@ class PreviewApp:
     def run(self, filepaths=None):
         self._pending_files = list(filepaths or [])
         log.info("Opening %d file(s) from the command line", len(self._pending_files))
-        html = build_html()
+        html = build_html().replace(
+            "window.previewmdNativeDropReady = false;",
+            "window.previewmdNativeDropReady = false;\nwindow.previewmdSettings = "
+            + json.dumps(self._settings)
+            + ";",
+            1,
+        )
         window_options = {
             "html": html,
             "js_api": self._api,
