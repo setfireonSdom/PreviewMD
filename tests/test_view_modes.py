@@ -101,6 +101,27 @@ class ViewModeTests(unittest.TestCase):
         self.assertIn("document.getElementById('search-input').addEventListener('compositionend', function() {", self.document)
         self.assertIn("searchComposing = false;", self.document)
 
+    def test_macos_tab_shortcuts_are_handled_in_the_page(self):
+        for marker in (
+            "if (meta && !e.shiftKey && key === 'w') {",
+            "if (activeIdx >= 0) closeTab(activeIdx);",
+            "if (meta && !e.shiftKey && /^[1-9]$/.test(e.key)) {",
+            "if (tabIndex < tabs.length) switchTab(tabIndex);",
+            "if (meta && e.shiftKey && key === 't') {",
+            "reopenClosedTab();",
+        ):
+            self.assertIn(marker, self.document)
+
+    def test_closed_tabs_can_be_reopened_through_python(self):
+        for marker in (
+            "function rememberClosedTab(tab) {",
+            "async function reopenClosedTab() {",
+            "rememberClosedTab(tab);",
+            "window.closeActiveTab = function() {",
+            "callBridge('reopen_path', entry.path);",
+        ):
+            self.assertIn(marker, self.document)
+
     def test_editor_search_paints_highlights_behind_the_textarea(self):
         layer_tag, layer_attributes = self.elements["editor-highlights"]
         self.assertEqual(layer_tag, "div")

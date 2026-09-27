@@ -2,6 +2,38 @@
 
 macOS 上的 Markdown 预览工具，拖拽 `.md` 或 `.txt` 文件即可渲染预览。
 
+## 快速开始
+
+**方式 A：从源码运行（自己用最省事）**
+
+```bash
+git clone https://github.com/setfireonSdom/PreviewMD.git
+cd PreviewMD
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+
+.venv/bin/python preview.py              # 打开空窗口
+.venv/bin/python preview.py book.md      # 直接打开文件
+```
+
+**方式 B：下载 DMG 安装包**
+
+Releases 页面提供两个包：`PreviewMD-<版本>-arm64.dmg`（Apple Silicon）和
+`PreviewMD-<版本>-x86_64.dmg`（Intel Mac），按自己的机器选一个，双击后拖进「应用程序」。
+
+> **首次打开提示「无法验证开发者」？**
+> 本项目没有付费的 Apple 开发者签名，所以下载来的文件会被 macOS 标记为未验证。
+> 任选一种方式处理（只需做一次）：
+>
+> ```bash
+> # 方式 1：在访达里右键 App → 打开 → 再点「打开」
+>
+> # 方式 2：终端里去掉隔离标记
+> xattr -dr com.apple.quarantine /Applications/PreviewMD.app
+> ```
+>
+> **从源码构建出来的 App 不带隔离标记，可以直接双击打开。**
+
 ## 功能
 
 - **多标签页** — 同时打开多份文档，点击标签切换，鼠标悬停显示关闭按钮
@@ -99,6 +131,10 @@ python3 preview.py your-file.md notes.md
 | 撤销 / 重做 | 编辑器聚焦时 `Cmd/Ctrl + Z` 撤销、`Cmd/Ctrl + Shift + Z` 重做；每个标签各自保留历史，切换标签不会丢 |
 | 磁盘冲突处理 | 本地有未保存编辑时文件又被外部修改，会显示冲突横幅：`Load disk version` 放弃本地编辑并载入磁盘版本，`Keep my edits` 保留本地内容并继续暂停自动保存 |
 | 搜索 | `Cmd/Ctrl + F` 打开搜索；Preview 搜索渲染正文，Edit 和 Split 搜索 Markdown 源码；`Enter` 下一个，`Shift + Enter` 上一个 |
+| 关闭标签 | `Cmd/Ctrl + W` 关闭当前标签（有未保存内容会先确认） |
+| 切换标签 | `Cmd/Ctrl + 1`…`9` 跳到第 1–9 个标签 |
+| 重开已关闭 | `Cmd/Ctrl + Shift + T` 恢复最近关闭的标签（文件会重新开始监听） |
+| 应用菜单 | macOS 菜单栏的 `File` 菜单：打开、新建、保存、另存为、从磁盘重载、关闭标签、重开已关闭标签 |
 | 导出 HTML | 点标签栏的导出图标 → `Export HTML...`，在系统保存对话框中选位置 |
 | 打印 / PDF | 点标签栏的导出图标 → `Print / Save as PDF...` 打开系统打印对话框；在 macOS 对话框左下角的 PDF 菜单选择“存储为 PDF” |
 | 自动刷新 | 通过拖拽、`+` 或命令行打开的文件都会被监听：磁盘外部更新会自动载入（蓝点 + 提示），编辑冲突显示红点与横幅；监听之外还有每 2 秒的轻量兜底检查，漏掉系统事件时也能同步 |
@@ -268,7 +304,13 @@ PreviewMD 会保留常见 Markdown 生成的 HTML，但会移除 `<script>`、�
 
 ### 编码
 
-文件必须为 UTF-8 编码，否则可能出现乱码。绝大多数编辑器的默认编码就是 UTF-8。
+文件必须为 **UTF-8**（含带 BOM 的 UTF-8）编码，否则可能乱码或打不开。绝大多数编辑器的默认编码就是 UTF-8。
+
+### 远程图片与隐私
+
+文档里的 `http://` / `https://` 图片会被**真实加载**，也就是说打开这份文档时，你的 IP 地址和访问时间会发给图片所在的服务器。PreviewMD 本身不联网、不收集任何数据，但**内容里的远程图片会联网**。如果文档来自不可信来源，可以在预览前先把这些图片链接删掉，或改成本地图片。
+
+本地图片（`![](assets/xx.png)`）不会联网，只在本地读取。
 
 ### 换行渲染
 
@@ -344,3 +386,17 @@ bash build.sh
 - 只在“没有指定文件”启动时才会恢复；命令行传了文件、或双击文件启动时不恢复
 - 只有带路径的标签页会被恢复；`Untitled` 草稿必须先用 `Cmd/Ctrl + Shift + S` 保存
 - 会话文件位于 `~/Library/Application Support/PreviewMD/session.json`，删除它即可清空恢复记录
+
+---
+
+## 架构支持与签名说明
+
+- **架构**：Releases 同时提供 **arm64**（Apple Silicon）与 **x86_64**（Intel Mac）两个 DMG。本地 `bash build.sh` 构建的是**当前机器架构**。
+- **签名**：项目使用 **ad-hoc 签名**（`codesign --sign -`），**没有**付费的 Apple 开发者签名与公证。
+  - 从源码构建 / 本机复制出来的 App **不带隔离标记，可以直接双击打开**。
+  - 从 Releases 下载的 App 会被 macOS 标记为「未验证的开发者」，首次打开按[快速开始](#快速开始)里的 `xattr` 说明处理一次即可。
+
+## 许可协议
+
+本项目基于 [MIT License](LICENSE) 开源。
+

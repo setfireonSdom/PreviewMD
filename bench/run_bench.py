@@ -103,6 +103,50 @@ window.__BENCH_RESULT = null;
 """
 
 
+SHORTCUT_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function press(key, options) {
+    document.dispatchEvent(new KeyboardEvent("keydown", Object.assign({ key: key, bubbles: true, cancelable: true }, options || {})));
+}
+function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+(async function () {
+    var results = {};
+    window.addTabFromPython("first.md", null, "# First\n\ncontent", null);
+    if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+    window.addTabFromPython("second.md", null, "# Second\n\ncontent", null);
+    if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+    results.openedTabs = tabs.length;
+
+    // Cmd+2 -> switch to the second tab
+    press("2", { metaKey: true });
+    await wait(60);
+    results.afterCmd2 = { activeIndex: activeIdx, name: tabs[activeIdx] ? tabs[activeIdx].name : null };
+
+    // Cmd+W -> close the active tab
+    press("w", { metaKey: true });
+    await wait(200);
+    results.afterCmdW = { tabCount: tabs.length, closedName: "second.md" };
+
+    // Cmd+Shift+T -> reopen it
+    press("t", { metaKey: true, shiftKey: true });
+    await wait(300);
+    results.afterCmdShiftT = { tabCount: tabs.length, activeName: tabs[activeIdx] ? tabs[activeIdx].name : null };
+
+    // A digit that has no tab must do nothing
+    press("9", { metaKey: true });
+    await wait(60);
+    results.afterCmd9 = { tabCount: tabs.length, activeName: tabs[activeIdx] ? tabs[activeIdx].name : null };
+
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
 def synthetic_samples() -> dict[str, str]:
     paragraph = (
         "一般年轻的读者，一看这本书是文言文，也许会以为难得读懂，不感兴趣。"
@@ -192,6 +236,9 @@ def main() -> int:
     parser.add_argument("sample", nargs="?", help="synthetic sample name")
     parser.add_argument("--file", help="measure a real Markdown file instead")
     parser.add_argument("--editor", action="store_true", help="force the editor round trip on large documents")
+    parser.add_argument(
+        "--shortcuts", action="store_true", help="verify the tab keyboard shortcuts instead of timing"
+    )
     parser.add_argument("--json", action="store_true", help="print raw JSON")
     args = parser.parse_args()
 
@@ -203,6 +250,12 @@ def main() -> int:
             if args.sample not in samples:
                 parser.error(f"unknown sample {args.sample!r}; choose from {', '.join(samples)}")
             samples = {args.sample: samples[args.sample]}
+
+    if args.shortcuts:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), SHORTCUT_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
 
     report = {}
     for name, document in samples.items():

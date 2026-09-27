@@ -24,7 +24,9 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 
 import webview
+from webview import Menu
 from webview.dom import DOMEventHandler
+from webview.menu import MenuAction, MenuSeparator
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -266,9 +268,58 @@ def content_hash(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# Documents are read defensively: a preview tool must not hang or die on a
+# surprising file, and it must tell the user why instead of failing silently.
+MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
+BINARY_SNIFF_BYTES = 8192
+DOCUMENT_ENCODINGS = ("utf-8-sig", "gb18030")
+DEFAULT_DOCUMENT_ENCODING = "utf-8-sig"
+
+
+class DocumentReadError(OSError):
+    """A document cannot be turned into previewable text.
+
+    Subclasses OSError so existing file-IO error handling keeps working.
+    """
+
+
+def decode_document(raw):
+    """Decode document bytes as UTF-8 (with or without BOM), else as GB18030."""
+    if b"\x00" in raw[:BINARY_SNIFF_BYTES]:
+        raise DocumentReadError("这看起来是二进制文件，而不是文本")
+    for encoding in DOCUMENT_ENCODINGS:
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    raise DocumentReadError("无法识别文件编码（既不是 UTF-8，也不是 GB18030）")
+
+
+def read_document(filepath):
+    """Read a document and return (text, encoding). Raises DocumentReadError.
+
+    A missing file is re-raised as FileNotFoundError so callers can still tell
+    "the document was deleted" apart from "the document could not be read".
+    """
+    try:
+        size = os.path.getsize(filepath)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise DocumentReadError(error.strerror or str(error)) from error
+    if size > MAX_DOCUMENT_BYTES:
+        raise DocumentReadError(f"文件过大（{size / 1024 / 1024:.1f} MB），已跳过")
+    try:
+        with open(filepath, "rb") as source:
+            return decode_document(source.read())
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise DocumentReadError(error.strerror or str(error)) from error
+
+
 def read_utf8_with_hash(filepath):
-    with open(filepath, "r", encoding="utf-8") as source:
-        content = source.read()
+    content, _ = read_document(filepath)
     return content, content_hash(content)
 
 
@@ -2557,6 +2608,45 @@ function addTab(name, path, content, diskHash) {{
 }}
 
 // ── Close a tab ──
+// Closed tabs can be brought back with Cmd+Shift+T. Documents with a path are
+// reopened through Python so the file watch is restored; drafts stay in the UI.
+var RECENTLY_CLOSED_LIMIT = 20;
+var recentlyClosed = [];
+
+function rememberClosedTab(tab) {{
+    if (!tab) return;
+    recentlyClosed.push({{
+        name: tab.name,
+        path: tab.path,
+        content: tab.content,
+        diskHash: tab.diskHash,
+        editorScroll: tab.editorScroll || 0,
+        previewScroll: tab.previewScroll || 0
+    }});
+    if (recentlyClosed.length > RECENTLY_CLOSED_LIMIT) recentlyClosed.shift();
+}}
+
+async function reopenClosedTab() {{
+    if (!recentlyClosed.length) {{
+        showStatus('No recently closed tabs.');
+        return;
+    }}
+    var entry = recentlyClosed.pop();
+    if (!entry.path) {{
+        addTab(entry.name, null, entry.content, null);
+        var restored = tabs[tabs.length - 1];
+        restored.editorScroll = entry.editorScroll;
+        restored.previewScroll = entry.previewScroll;
+        return;
+    }}
+    try {{
+        await callBridge('reopen_path', entry.path);
+    }} catch (error) {{
+        recentlyClosed.push(entry);
+        showStatus(error.message || 'Could not reopen that document.');
+    }}
+}}
+
 async function closeTab(index) {{
     if (index < 0 || index >= tabs.length) return;
     var tab = tabs[index];
@@ -2579,6 +2669,7 @@ async function closeTab(index) {{
         window.pywebview.api.stop_watching(path);
     }}
 
+    rememberClosedTab(tab);
     tabs.splice(index, 1);
 
     if (tabs.length === 0) {{
@@ -3696,6 +3787,25 @@ document.addEventListener('keydown', function(e) {{
         return;
     }}
 
+    if (meta && e.shiftKey && key === 't') {{
+        e.preventDefault();
+        reopenClosedTab();
+        return;
+    }}
+
+    if (meta && !e.shiftKey && key === 'w') {{
+        e.preventDefault();
+        if (activeIdx >= 0) closeTab(activeIdx);
+        return;
+    }}
+
+    if (meta && !e.shiftKey && /^[1-9]$/.test(e.key)) {{
+        e.preventDefault();
+        var tabIndex = Number(e.key) - 1;
+        if (tabIndex < tabs.length) switchTab(tabIndex);
+        return;
+    }}
+
     if (e.key === 'Escape') {{
         if (document.getElementById('lightbox').classList.contains('open')) {{
             closeLightbox();
@@ -3849,6 +3959,11 @@ window.openPathFromPython = function(name, path, content, diskHash) {{
     addTab(name, path, content, diskHash);
 }};
 
+// Called from the native File menu (Close Tab)
+window.closeActiveTab = function() {{
+    if (activeIdx >= 0) return closeTab(activeIdx);
+}};
+
 // Called from Python after the previous session's tabs have been reopened
 window.finishSessionRestore = function(state) {{
     if (!state || typeof state !== 'object') return;
@@ -3871,6 +3986,42 @@ window.finishSessionRestore = function(state) {{
 
 # ─── Application ─────────────────────────────────────────────────────────────
 
+def build_application_menu(app):
+    """A native macOS File menu so PreviewMD behaves like a Mac application.
+
+    The page implements the same shortcuts itself, because this pywebview
+    version does not attach key equivalents to menu items. Only a File menu is
+    added: pywebview already contributes the standard View and Edit menus, and a
+    second menu with the same title would show up twice in the menu bar.
+    """
+    def dispatch(js_call):
+        def action():
+            if app._window is None:
+                return
+            try:
+                app._window.evaluate_js(js_call)
+            except Exception as error:
+                print(f"Menu action failed: {error}", file=sys.stderr)
+        return action
+
+    def open_document():
+        if app._window is not None:
+            app._api.open_file()
+
+    return [
+        Menu("File", [
+            MenuAction("Open…", open_document),
+            MenuAction("New Document", dispatch("window.newUntitledTab()")),
+            MenuAction("Save", dispatch("window.saveFile()")),
+            MenuAction("Save As…", dispatch("window.saveFileAs()")),
+            MenuAction("Reload from Disk", dispatch("window.reloadActiveTab()")),
+            MenuSeparator(),
+            MenuAction("Close Tab", dispatch("window.closeActiveTab()")),
+            MenuAction("Reopen Closed Tab", dispatch("window.reopenClosedTab()")),
+        ]),
+    ]
+
+
 class Api:
     """JS-Python bridge exposed to the webview."""
 
@@ -3891,6 +4042,13 @@ class Api:
         """Called from JS when drag-drop provides a file path."""
         if filepath and filepath.lower().endswith((".md", ".txt")) and os.path.isfile(filepath):
             self._app.load_file(filepath)
+
+    def reopen_path(self, filepath):
+        """Re-open a recently closed document so the file watch is restored."""
+        if not filepath or not os.path.isfile(filepath):
+            return {"ok": False, "error": "That file no longer exists on disk."}
+        self._app.load_file(filepath)
+        return {"ok": True, "path": filepath}
 
     def save_session(self, state):
         """Persist the open tab list; the UI owns the tab shape."""
@@ -4184,19 +4342,28 @@ class PreviewApp:
         return os.path.realpath(os.path.abspath(filepath))
 
     def load_file(self, filepath):
-        """Read a .md file, send to JS as a new tab, and start watching."""
+        """Read a .md/.txt document, send it to JS as a new tab, and start watching."""
         filepath = self._normalize_path(filepath)
-        if not filepath.lower().endswith((".md", ".txt")) or not os.path.exists(filepath):
-            return
-
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            print(f"Error reading file: {e}", file=sys.stderr)
+        if not filepath.lower().endswith((".md", ".txt")):
             return
 
         filename = os.path.basename(filepath)
+        if not os.path.exists(filepath):
+            self._show_ui_status(f"无法打开 {filename}：文件不存在。")
+            return
+        try:
+            content, encoding = read_document(filepath)
+        except DocumentReadError as error:
+            self._show_ui_status(f"无法打开 {filename}：{error}。")
+            return
+        except FileNotFoundError:
+            self._show_ui_status(f"无法打开 {filename}：文件不存在。")
+            return
+        if encoding != DEFAULT_DOCUMENT_ENCODING:
+            self._show_ui_status(
+                f"{filename}：已按 {encoding} 解码打开；保存后会转为 UTF-8。"
+            )
+
         escaped_name = json.dumps(filename)
         escaped_path = json.dumps(filepath)
         escaped_content = json.dumps(content)
@@ -4449,19 +4616,27 @@ class PreviewApp:
     def run(self, filepaths=None):
         self._pending_files = list(filepaths or [])
         html = build_html()
-        self._window = webview.create_window(
-            "PreviewMD",
-            html=html,
-            js_api=self._api,
-            width=1100,
-            height=850,
-            min_size=(600, 400),
-            text_select=True,
-        )
+        window_options = {
+            "html": html,
+            "js_api": self._api,
+            "width": 1100,
+            "height": 850,
+            "min_size": (600, 400),
+            "text_select": True,
+        }
+        try:
+            self._window = webview.create_window("PreviewMD", menu=build_application_menu(self), **window_options)
+            webview.start(debug=False)
+        except Exception as error:
+            # A menu problem must never stop the app from starting. pywebview
+            # builds the native menu inside start(), so the retry has to wrap
+            # both calls.
+            print(f"Custom menu unavailable ({error}); retrying without it.", file=sys.stderr)
+            self._window = webview.create_window("PreviewMD", **window_options)
+            webview.start(debug=False)
         self._window.events.loaded += self._on_loaded
         self._window.events.closing += self._on_closing
 
-        webview.start(debug=False)
         self._cleanup()
 
     def _cleanup(self):

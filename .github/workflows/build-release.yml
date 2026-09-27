@@ -52,9 +52,37 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Intel Mac build. macos-13 is the last x86_64 runner; macos-14 and newer are
+  # Apple Silicon. Kept as a separate job so the arm64 job keeps its outputs
+  # that the publish job consumes.
+  build-intel:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install build and test dependencies in project venv
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt 'pyinstaller==6.20.0'
+      - name: Build app and DMG
+        env:
+          PYTHON: ${{ github.workspace }}/.venv/bin/python
+        run: bash build.sh
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: PreviewMD-macos-${{ runner.arch }}
+          path: dist/*/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true }}
-    needs: build
+    needs: [build, build-intel]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -75,4 +103,4 @@ jobs:
           gh release create "$RELEASE_TAG" release-artifacts/*.dmg \
             --target "$RELEASE_COMMIT" \
             --title "$RELEASE_NAME" \
-            --notes 'macOS build. Ad-hoc signed; not Developer ID signed or notarized.'
+            --notes 'macOS build for Apple Silicon (arm64) and Intel Mac (x86_64). Ad-hoc signed; not Developer ID signed or notarized. See the README for the one-time Gatekeeper step.'
