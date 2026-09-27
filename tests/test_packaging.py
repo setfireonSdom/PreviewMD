@@ -4,7 +4,6 @@ from pathlib import Path
 
 import app_metadata
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 

@@ -102,8 +102,14 @@ def extract_reporter() -> str:
     if match is None:
         raise AssertionError("reportPageError is missing from the page")
     parts = [match.group(0)]
-    for name in ("reportedErrorCount", "suppressedErrorCount", "lastReportedError", "lastReportedErrorRepeats", "REPORT_EVERY_REPEAT"):
-        found = re.search(r"var %s = [^;]+;" % name, document)
+    for name in (
+        "reportedErrorCount",
+        "suppressedErrorCount",
+        "lastReportedError",
+        "lastReportedErrorRepeats",
+        "REPORT_EVERY_REPEAT",
+    ):
+        found = re.search(rf"var {name} = [^;]+;", document)
         if found is None:
             raise AssertionError(f"missing {name}")
         parts.insert(0, found.group(0))

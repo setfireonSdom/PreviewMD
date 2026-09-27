@@ -5,33 +5,32 @@ Drag .md files into the window, or use File > Open.
 Supports GFM, code highlighting, LaTeX math, multi-tab, and auto-refresh on file changes.
 """
 
-import sys
-import os
-import json
-import time
-import hashlib
 import base64
 import binascii
+import hashlib
 import html
+import json
 import logging
+import os
 import re
 import stat
+import sys
 import tempfile
 import threading
+import time
 import unicodedata
 import webbrowser
-from logging import handlers as logging_handlers
 from collections import OrderedDict
+from logging import handlers as logging_handlers
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 
 import webview
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 from webview import Menu
 from webview.dom import DOMEventHandler
 from webview.menu import MenuAction, MenuSeparator
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 IMAGE_CACHE_MAX_BYTES = 48 * 1024 * 1024
@@ -357,9 +356,12 @@ def atomic_write_utf8(filepath, content, expected_hash=None, force=False, replac
     try:
         original_mode = stat.S_IMODE(os.stat(filepath).st_mode)
         _, current_hash = read_utf8_with_hash(filepath)
-    except FileNotFoundError:
+    except FileNotFoundError as error:
         if not force:
-            raise SaveConflictError(None)
+            # Keep the FileNotFoundError as the cause: "the file is gone" is a
+            # different situation from "the file changed", and the log is the
+            # only place that can tell them apart later.
+            raise SaveConflictError(None) from error
         original_mode = 0o644
         current_hash = None
     if not force and expected_hash != current_hash:
@@ -567,7 +569,7 @@ def normalize_session(payload):
 def load_session(filepath=None):
     filepath = filepath or session_file_path()
     try:
-        with open(filepath, "r", encoding="utf-8") as source:
+        with open(filepath, encoding="utf-8") as source:
             return normalize_session(json.load(source))
     except (OSError, ValueError):
         return normalize_session(None)
@@ -674,7 +676,7 @@ class FileChangeHandler(FileSystemEventHandler):
 def _read_resource(filename):
     base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     path = os.path.join(base_dir, "resources", filename)
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 
@@ -1846,9 +1848,9 @@ function renderMathTextNodes(nodes) {{
     }});
 }}
 
-// Collect the text nodes that may contain LaTeX and restore escaped \$ everywhere
-// else. Escaped dollars stay tokenized until after the math check so that "\$5"
-// is never mistaken for a formula.
+// Collect the text nodes that may contain LaTeX and restore escaped dollar signs
+// everywhere. An escaped dollar stays tokenized until after the math check, so a
+// literal "$5" is never mistaken for a formula.
 function prepareMathCandidates(root) {{
     var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
     var nodes = [];

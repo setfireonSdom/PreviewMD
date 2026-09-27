@@ -1,0 +1,26 @@
+# Lint configuration. PreviewMD has no formatter and no pre-commit history, so
+# this starts from "catch real defects" rather than restyling the codebase.
+#
+# Rules are chosen for value per unit of churn:
+#   E, F   syntax errors, undefined names, unused imports, f-strings without
+#          placeholders: these are bugs, not style.
+#   W      invalid escape sequences. This codebase inlines JavaScript into a
+#          Python f-string, where a stray "\$" or "\s" is a live hazard.
+#   B      bugbear: a few classes of real mistake (B904 loses exception chains).
+#   UP     pyupgrade: mostly mechanical, low risk.
+#   C4, PIE, I  comprehension and import tidying; the codebase is close enough
+#          to these that enabling them costs almost nothing today.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv", "build", "dist", "resources"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "C4", "PIE", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# preview.py inlines KaTeX, highlight.js and the application stylesheet into a
+# single f-string. Those lines are vendored content: they cannot be wrapped, and
+# appending a "# noqa" comment would corrupt the CSS or JavaScript itself.
+"preview.py" = ["E501"]

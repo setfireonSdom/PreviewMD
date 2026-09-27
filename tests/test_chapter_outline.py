@@ -36,9 +36,11 @@ class ChapterOutlineTests(unittest.TestCase):
     def test_active_outline_entry_is_found_without_reading_every_rect(self):
         # A novel can have >1500 chapters; one layout read per target per scroll
         # frame would make scrolling stutter, so the search is a binary search.
+        # The behavioural half of this lives in OutlineLookupCostTests below:
+        # a string check cannot tell a binary search from a linear scan, because
+        # the linear version can be written with any formatting at all.
         self.assertIn("function activeTocTarget() {", self.document)
         self.assertIn("var middle = (low + high) >> 1;", self.document)
-        self.assertNotIn("for (var i = 0; i < tocTargets.length; i++) {\n        if (tocTargets[i].element.getBoundingClientRect()", self.document)
 
     def test_outline_keeps_the_active_entry_in_view(self):
         for marker in (

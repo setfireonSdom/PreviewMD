@@ -48,7 +48,7 @@ function simulate(length) {
     }
     return { steps: tab.undoStack.length, degraded: tab.undoDegraded, notices: notices.length };
 }
-var sizes = %(sizes)s;
+var sizes = __SIZES__;
 var out = {};
 sizes.forEach(function (length) { out[length] = simulate(length); });
 console.log(JSON.stringify(out));
@@ -60,12 +60,12 @@ def extract_undo_javascript() -> str:
     document = build_html()
     parts = []
     for name in CONSTANTS:
-        match = re.search(r"var %s = [^;]+;" % name, document)
+        match = re.search(rf"var {name} = [^;]+;", document)
         if match is None:
             raise AssertionError(f"missing constant {name}")
         parts.append(match.group(0))
     for name in FUNCTIONS:
-        match = re.search(r"function %s\(.*?\n\}" % name, document, re.S)
+        match = re.search(rf"function {name}\(.*?\n\}}", document, re.S)
         if match is None:
             raise AssertionError(f"missing function {name}")
         parts.append(match.group(0))
@@ -77,12 +77,8 @@ class UndoHistoryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sizes = [40_000, 350_000, 1_000_000, 1_706_746, 2_165_059, 21_000_000]
-        driver = (
-            PRELUDE
-            + extract_undo_javascript()
-            + "\n"
-            + DRIVER % {"sizes": json.dumps(cls.sizes)}
-        )
+        # A token, not str.format: the driver is full of JavaScript braces.
+        driver = PRELUDE + extract_undo_javascript() + "\n" + DRIVER.replace("__SIZES__", json.dumps(cls.sizes))
         result = subprocess.run(
             ["node", "-e", driver], capture_output=True, text=True, timeout=120
         )

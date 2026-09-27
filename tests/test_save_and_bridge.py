@@ -280,7 +280,9 @@ class FileChangeHandlerTests(unittest.TestCase):
         calls = []
         handler = FileChangeHandler("/tmp/example-note.md", 3, lambda path, token: calls.append((path, token)))
 
-        handler.on_moved(SimpleNamespace(is_directory=False, src_path="/tmp/.example-note.md.tmp", dest_path="/tmp/example-note.md"))
+        handler.on_moved(SimpleNamespace(
+            is_directory=False, src_path="/tmp/.example-note.md.tmp", dest_path="/tmp/example-note.md"
+        ))
 
         self.assertEqual(calls, [("/tmp/example-note.md", 3)])
 

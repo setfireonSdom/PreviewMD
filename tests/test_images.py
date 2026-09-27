@@ -15,7 +15,6 @@ from preview import (
     resolve_local_image_path,
 )
 
-
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"test-payload"
 GIF_BYTES = b"GIF89a" + b"test-payload"
 

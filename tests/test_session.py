@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest import mock
 
 from preview import (
-    Api,
     PreviewApp,
     content_hash,
     display_path,
@@ -447,7 +446,10 @@ class FeatureMarkerTests(unittest.TestCase):
             "function applyDiskSnapshot(tab, content, diskHash)",
             "function keepLocalEdits()",
             "conflictBannerDismissed",
-            "if (tab.dirty && !window.confirm('This tab has unsaved edits. Discard them and load the version on disk?')) return;",
+            (
+                "if (tab.dirty && !window.confirm('This tab has unsaved edits."
+                " Discard them and load the version on disk?')) return;"
+            ),
             "function undoEditor()",
             "function redoEditor()",
             "function commitUndoSnapshot(tab)",

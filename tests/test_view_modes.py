@@ -97,8 +97,14 @@ class ViewModeTests(unittest.TestCase):
     def test_search_pauses_editor_jumps_during_ime_composition(self):
         self.assertIn("if (searchMatches.length > 0 && !searchComposing) {", self.document)
         self.assertIn("if (e.isComposing) return;", self.document)
-        self.assertIn("document.getElementById('search-input').addEventListener('compositionstart', function() {", self.document)
-        self.assertIn("document.getElementById('search-input').addEventListener('compositionend', function() {", self.document)
+        self.assertIn(
+            "document.getElementById('search-input').addEventListener('compositionstart', function() {",
+            self.document,
+        )
+        self.assertIn(
+            "document.getElementById('search-input').addEventListener('compositionend', function() {",
+            self.document,
+        )
         self.assertIn("searchComposing = false;", self.document)
 
     def test_macos_tab_shortcuts_are_handled_in_the_page(self):
@@ -163,8 +169,14 @@ class ViewModeTests(unittest.TestCase):
         card_tag, _ = self.elements["dropzone-card"]
         self.assertEqual(card_tag, "div")
         for marker in (
-            "#dropzone {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    min-height: 100%;",
-            "#dropzone-card {\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n    width: min(400px, calc(100% - 48px));",
+            (
+                "#dropzone {\n    display: flex;\n    align-items: center;\n"
+                "    justify-content: center;\n    min-height: 100%;"
+            ),
+            (
+                "#dropzone-card {\n    display: flex;\n    flex-direction: column;\n"
+                "    align-items: center;\n    width: min(400px, calc(100% - 48px));"
+            ),
             "#dropzone.drag-over #dropzone-card {",
             "background: var(--accent);\n    color: var(--accent-text);",
         ):

@@ -107,7 +107,8 @@ SHORTCUT_WORKLOAD = r"""
 window.__BENCH_DONE = false;
 window.__BENCH_RESULT = null;
 function press(key, options) {
-    document.dispatchEvent(new KeyboardEvent("keydown", Object.assign({ key: key, bubbles: true, cancelable: true }, options || {})));
+    document.dispatchEvent(new KeyboardEvent("keydown", Object.assign(
+        { key: key, bubbles: true, cancelable: true }, options || {})));
 }
 function wait(ms) {
     return new Promise(function(resolve) { setTimeout(resolve, ms); });
@@ -457,7 +458,7 @@ def synthetic_samples() -> dict[str, str]:
 
 def run_in_webview(html: str, script: str, timeout: float = 300.0) -> dict:
     import AppKit
-    from Foundation import NSDate, NSRunLoop, NSURL
+    from Foundation import NSURL, NSDate, NSRunLoop
     from WebKit import WKWebView, WKWebViewConfiguration
 
     def pump(seconds: float) -> None:

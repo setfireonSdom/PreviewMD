@@ -33,7 +33,7 @@ class FakeWindow:
 
 class DocumentDecodingTests(unittest.TestCase):
     def test_plain_utf8_is_read_without_a_bom_marker(self):
-        text, encoding = decode_document("标题\n正文".encode("utf-8"))
+        text, encoding = decode_document("标题\n正文".encode())
         self.assertEqual(text, "标题\n正文")
         self.assertEqual(encoding, "utf-8-sig")
 
@@ -110,7 +110,7 @@ class ReadDocumentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             utf8 = Path(temporary_directory) / "a.md"
             gb = Path(temporary_directory) / "b.md"
-            utf8.write_bytes("同样的内容".encode("utf-8"))
+            utf8.write_bytes("同样的内容".encode())
             gb.write_bytes("同样的内容".encode("gb18030"))
             self.assertEqual(
                 read_utf8_with_hash(utf8)[1],
