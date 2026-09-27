@@ -17,7 +17,7 @@
 
 ### 工程
 - 新增 `ruff` 配置（`pyproject.toml`）与 `requirements-dev.txt`，CI 在两个架构的 job 里都跑 lint
-- Intel (x86_64) 的 CI job 此前只验证"能编译"，现在同样跑 lint 和完整测试——之前那个 x86_64 构建是"没报错"而不是"验证过"
+- Intel (x86_64) 的 CI job 同样跑 lint 和完整测试——之前那个 x86_64 构建是"没报错"而不是"验证过"。**但补上这一步之后才发现，该 job 写的 `runs-on: macos-13` 指向一个已被移除的镜像，因此从未真正执行过**；已改为 `macos-15-intel`，arm64 一并从已标记 deprecated 的 `macos-14` 迁到 `macos-15`。同时加了 concurrency，新推送会自动取消上一轮，避免像这次一样积压 6 个永不结束的队列
 - lint 修掉 19 处真问题：未用导入、`open(f, "r")`、`.encode("utf-8")`、导入排序，以及 `atomic_write_utf8` 丢失 `FileNotFoundError` 异常链（现在保留原因，日志里能区分"文件被删"和"文件被改"）
 - 清理两处 f-string 里的无效转义 `\$`（出现在描述转义规则的 JS 注释里），改为不含反斜杠的措辞
 - 用行为测试替掉一个无效的字符串断言：原断言查找的线性扫描代码片段在页面里根本不存在，改任何格式都能绕过。新的 `tests/test_outline_lookup_cost.py` 用 2000 个会计数的假章节跑真实的 `activeTocTarget`，断言布局读取次数 ≤20（二分查找约 11 次，线性扫描 1002 次）

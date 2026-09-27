@@ -15,9 +15,17 @@ on:
 permissions:
   contents: read
 
+# A new push supersedes the previous run. Without this, a run whose runner label
+# no longer exists sits in the queue forever and every later run piles up behind
+# it: six had accumulated before this was noticed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14 is marked deprecated upstream. macos-15 is the current arm64 image.
+    runs-on: macos-15
     outputs:
       tag: ${{ steps.metadata.outputs.tag }}
       name: ${{ steps.metadata.outputs.name }}
@@ -54,11 +62,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Intel Mac build. macos-13 is the last x86_64 runner; macos-14 and newer are
-  # Apple Silicon. Kept as a separate job so the arm64 job keeps its outputs
-  # that the publish job consumes.
+  # Intel Mac build, kept as a separate job so the arm64 job keeps the outputs
+  # the publish job consumes.
   build-intel:
-    runs-on: macos-13
+    # macos-13 was removed from the hosted images, so this job queued forever
+    # without ever reaching a runner. macos-15-intel is the current x64 label.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
         with:

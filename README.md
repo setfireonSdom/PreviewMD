@@ -438,6 +438,7 @@ bash build.sh
 ## 架构支持与签名说明
 
 - **架构**：Releases 同时提供 **arm64**（Apple Silicon）与 **x86_64**（Intel Mac）两个 DMG。本地 `bash build.sh` 构建的是**当前机器架构**。
+  - 两个架构都由 CI 分别构建与验证。GitHub 已下线 `macos-13` 镜像，早期的 x86_64 job 因此一直排队而从未执行；现在用 `macos-15`（arm64）与 `macos-15-intel`（x64）。若 GitHub 后续再调整镜像标签，这个 job 会重新变成"排队但不执行"——看到 CI 长时间排队却不出结论，先检查 `runs-on` 标签是否还有效。
 - **签名**：项目使用 **ad-hoc 签名**（`codesign --sign -`），**没有**付费的 Apple 开发者签名与公证。
   - 从源码构建 / 本机复制出来的 App **不带隔离标记，可以直接双击打开**。
   - 从 Releases 下载的 App 会被 macOS 标记为「未验证的开发者」，首次打开按[快速开始](#快速开始)里的 `xattr` 说明处理一次即可。
