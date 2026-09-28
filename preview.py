@@ -886,10 +886,19 @@ html, body {{
     overflow: hidden;
 }}
 
+/* The window is one column: tab bar, workspace, statistics bar. Letting flex
+   divide the height is what lets the statistics bar keep its own space without
+   the workspace having to subtract it. */
+body {{ display: flex; flex-direction: column; }}
+
 /* ── Tab bar ── */
 #tab-bar {{
     display: none;
     height: 36px;
+    /* Pinned: as a flex item the default shrink of 1 is a share of the whole
+       line, and the workspace below has a basis as tall as the document, so an
+       unpinned tab bar gets squeezed to a sliver on any long page. */
+    flex: 0 0 36px;
     background: var(--toolbar-bg);
     border-bottom: 1px solid var(--border);
     padding: 0 8px;
@@ -1340,12 +1349,39 @@ mark.search-highlight.current {{
 }}
 
 /* ── Main area ── */
+/* flex-basis 0 so the workspace gets exactly what is left over instead of
+   starting from the height of its own content and being shrunk back. */
 #main-area {{
     position: relative;
-    height: calc(100% - 36px);
+    flex: 1 1 0px;
+    min-height: 0;
     overflow: hidden;
 }}
-body:not(.has-tabs) #main-area {{ height: 100%; }}
+
+/* ── Document statistics ── */
+#status-bar {{
+    display: none;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    height: 24px;
+    padding: 0 clamp(10px, 2vw, 16px);
+    border-top: 1px solid var(--border);
+    background: var(--toolbar-bg);
+    color: var(--dropzone-text);
+    font-size: 11px;
+    line-height: 1;
+    white-space: nowrap;
+    user-select: none;
+    -webkit-user-select: none;
+}}
+body.has-tabs #status-bar {{ display: flex; }}
+/* The numbers change on every keystroke. Without containment that invalidates
+   the layout of the whole window, which on a novel-sized document means
+   re-laying out a very long text next to the count. */
+#status-bar .stat {{ contain: layout style; }}
+#status-bar .stat-sep {{ opacity: .55; }}
 
 #workspace {{ display: none; width: 100%; height: 100%; min-width: 0; }}
 body.has-tabs #workspace {{ display: flex; }}
@@ -1676,8 +1712,9 @@ body.edit-mode #content {{ display: none; }}
 
 @media print {{
     html, body {{ height: auto; overflow: visible; background: #fff; color: #111; }}
+    body {{ display: block; }}
     #tab-bar, #dropzone, #editor-wrap, #toc-sidebar, #search-bar, #conflict-banner,
-    #status-toast, #lightbox {{ display: none !important; }}
+    #status-toast, #status-bar, #lightbox {{ display: none !important; }}
     #main-area, #workspace {{ display: block !important; height: auto; overflow: visible; }}
     #content {{ display: block !important; height: auto; overflow: visible; padding: 0; color: #111; }}
     #content > * {{ max-width: none; }}
@@ -1789,6 +1826,12 @@ body.edit-mode #content {{ display: none; }}
 
   <div id="status-toast" role="status" aria-live="polite"></div>
 
+</div>
+
+<div id="status-bar" role="group" aria-label="Document statistics" title="Counted from the document source: words count one per Chinese character and one per English word, characters exclude spaces but include punctuation.">
+  <span id="status-words" class="stat">字数 0</span>
+  <span class="stat-sep" aria-hidden="true">·</span>
+  <span id="status-characters" class="stat">字符 0</span>
 </div>
 
 <div id="lightbox" role="dialog" aria-modal="true" aria-label="Image preview" aria-hidden="true">
@@ -2158,6 +2201,16 @@ function markdownChunkBoundaryIsInsideList(lines, index) {{
     return markdownLineContinuesList(previous) && markdownLineContinuesList(next);
 }}
 
+// A display formula written across several lines reaches the renderer as
+// `$$`, <br>, the formula, <br>, `$$`: the breaks renderer turns every newline
+// into an element, and the display-math pattern matches one text node, so it
+// never saw a whole formula and the page showed raw LaTeX. LaTeX reads a
+// newline as a space, so joining the lines is lossless and puts the formula back
+// inside a single text node, where a one-line $$…$$ already worked.
+function collapseDisplayMathLines(lines) {{
+    return lines.join(' ');
+}}
+
 // Split Markdown into chunks on blank lines, never inside a fenced code block,
 // a $$ display-math block, or a loose list. Link reference definitions are
 // hoisted so they keep resolving document-wide after the split.
@@ -2169,6 +2222,7 @@ function splitMarkdownChunks(text) {{
     var definitions = [];
     var fence = null;
     var inMathBlock = false;
+    var mathLines = null;
     var block = [];
 
     function flushBlock() {{
@@ -2209,14 +2263,21 @@ function splitMarkdownChunks(text) {{
             fence = {{ char: fenceOpen[1].charAt(0), length: fenceOpen[1].length }};
             continue;
         }}
-        if (inMathBlock) {{
-            block.push(line);
-            if (dollarCount % 2 === 1) inMathBlock = false;
-            continue;
-        }}
-        if (dollarCount % 2 === 1) {{
-            block.push(line);
-            inMathBlock = true;
+        if (inMathBlock || dollarCount % 2 === 1) {{
+            // A line with an odd number of $$ either opens or closes a display
+            // formula; the whole block becomes one line, so the formula itself
+            // is never broken by a renderer that reads newlines as breaks.
+            if (mathLines) mathLines.push(line);
+            else mathLines = [line];
+            if (dollarCount % 2 === 1) {{
+                if (inMathBlock) {{
+                    block.push(collapseDisplayMathLines(mathLines));
+                    mathLines = null;
+                    inMathBlock = false;
+                }} else {{
+                    inMathBlock = true;
+                }}
+            }}
             continue;
         }}
         if (line === '') {{
@@ -2229,6 +2290,11 @@ function splitMarkdownChunks(text) {{
             continue;
         }}
         block.push(line);
+    }}
+    // An unterminated $$ was never a formula; keep its lines as they were.
+    if (mathLines) {{
+        mathLines.forEach(function(pendingLine) {{ block.push(pendingLine); }});
+        mathLines = null;
     }}
     flushBlock();
     if (pending.length) chunks.push(pending.join('\\n\\n'));
@@ -2946,6 +3012,7 @@ function applyEditorSnapshot(tab, content, selection) {{
     refreshTab(tab);
     syncWindowTitle();
     if (isSearchOpen() && searchQuery) refreshEditorSearch();
+    scheduleDocumentStats(tab);
     scheduleAutosave(tab);
 }}
 
@@ -3073,6 +3140,7 @@ function renderActiveTab() {{
     var tab = tabs[activeIdx];
     document.body.classList.add('has-tabs');
     syncConflictBanner();
+    updateDocumentStats(tab);
     if (hasPreview()) {{
         var rendered = renderContent(tab.content, tab.path, false, tab);
         document.getElementById('content').scrollTop = tab.previewScroll || 0;
@@ -3109,6 +3177,130 @@ function syncWindowTitle() {{
     callBridge('set_title', title).catch(function() {{
         lastSentTitle = null;
     }});
+}}
+
+// ── Word count ──
+// WPS counts one word per Chinese character and one per run of Latin letters or
+// digits, and nothing at all for punctuation and whitespace. Counting the
+// document source rather than the rendered preview keeps the number identical in
+// every view mode and available before a long document finishes rendering;
+// Markdown syntax is punctuation, so it barely moves the total.
+var WORD_COUNT_FULL_SPEED_CHARS = 200000;
+var WORD_COUNT_LARGE_DELAY_MS = 600;
+var documentStatsTimer = null;
+
+function isWordIdeograph(code) {{
+    // Ideographs, kana and hangul: one character, one word.
+    return (code >= 0x4e00 && code <= 0x9fff) ||
+           (code >= 0x3400 && code <= 0x4dbf) ||
+           (code >= 0xf900 && code <= 0xfaff) ||
+           (code >= 0x3040 && code <= 0x30ff) ||
+           (code >= 0x1100 && code <= 0x11ff) ||
+           (code >= 0xac00 && code <= 0xd7af);
+}}
+
+function isWordLetter(code) {{
+    // Fullwidth Latin and digits count too: ＮＩＫＥＹ is a word to whoever
+    // typed it, and CJK text is full of them.
+    return (code >= 0x30 && code <= 0x39) ||
+           (code >= 0x41 && code <= 0x5a) ||
+           (code >= 0x61 && code <= 0x7a) ||
+           (code >= 0xff10 && code <= 0xff19) ||
+           (code >= 0xff21 && code <= 0xff3a) ||
+           (code >= 0xff41 && code <= 0xff5a);
+}}
+
+function isWordSpace(code) {{
+    return code === 32 || (code >= 9 && code <= 13) || code === 0xa0 ||
+           (code >= 0x2000 && code <= 0x200a) || code === 0x2028 || code === 0x2029 ||
+           code === 0x205f || code === 0x3000 || code === 0xfeff;
+}}
+
+function countDocumentText(text) {{
+    // One pass, no per-character allocation: a novel is millions of characters
+    // long and this runs while typing.
+    var source = text || '';
+    var length = source.length;
+    var words = 0;
+    var characters = 0;
+    var inWord = false;
+    for (var index = 0; index < length; index++) {{
+        var code = source.charCodeAt(index);
+        if (code >= 0xd800 && code <= 0xdbff && index + 1 < length) {{
+            var low = source.charCodeAt(index + 1);
+            if (low >= 0xdc00 && low <= 0xdfff) {{
+                // An astral character is one character, and the CJK extension
+                // blocks start at 0x20000. Emoji live below that and are
+                // characters without being words.
+                if (0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00) >= 0x20000) words += 1;
+                characters += 1;
+                inWord = false;
+                index += 1;
+                continue;
+            }}
+        }}
+        // A space ends the word it was inside, which is the whole difference
+        // between counting a run of letters and counting a sentence.
+        if (isWordSpace(code)) {{
+            inWord = false;
+            continue;
+        }}
+        characters += 1;
+        if (isWordLetter(code)) {{
+            if (!inWord) {{ words += 1; inWord = true; }}
+        }} else if (isWordIdeograph(code)) {{
+            words += 1;
+            inWord = false;
+        }} else if (inWord && (code === 0x27 || code === 0x2019) &&
+                   isWordLetter(source.charCodeAt(index + 1))) {{
+            // "don't" is one word, the way WPS and Word count it.
+        }} else {{
+            inWord = false;
+        }}
+    }}
+    return {{ words: words, characters: characters }};
+}}
+
+function formatCount(value) {{
+    // Pinned to en-US so the grouping never depends on the system locale.
+    return (value || 0).toLocaleString('en-US');
+}}
+
+function setStatusStat(id, value) {{
+    var element = document.getElementById(id);
+    if (!element || element.textContent === value) return;
+    element.textContent = value;
+}}
+
+function paintDocumentStats(tab) {{
+    if (activeIdx < 0 || activeIdx >= tabs.length || tabs[activeIdx] !== tab) return;
+    var counts = countDocumentText(tab.content);
+    setStatusStat('status-words', '字数 ' + formatCount(counts.words));
+    setStatusStat('status-characters', '字符 ' + formatCount(counts.characters));
+}}
+
+function updateDocumentStats(tab) {{
+    if (documentStatsTimer !== null) {{
+        clearTimeout(documentStatsTimer);
+        documentStatsTimer = null;
+    }}
+    paintDocumentStats(tab);
+}}
+
+function scheduleDocumentStats(tab) {{
+    // Counting is a single pass, but a novel-sized document is millions of
+    // characters and keystrokes arrive faster than one pass finishes, so small
+    // documents follow the keyboard and long ones update after a pause.
+    if (!tab) return;
+    if ((tab.content || '').length <= WORD_COUNT_FULL_SPEED_CHARS) {{
+        updateDocumentStats(tab);
+        return;
+    }}
+    if (documentStatsTimer !== null) clearTimeout(documentStatsTimer);
+    documentStatsTimer = setTimeout(function() {{
+        documentStatsTimer = null;
+        paintDocumentStats(tab);
+    }}, WORD_COUNT_LARGE_DELAY_MS);
 }}
 
 function markTabConflict(tab, diskContent, diskHash, message) {{
@@ -3178,6 +3370,7 @@ function applyDiskSnapshot(tab, content, diskHash) {{
         }}
         if (changed) flashActiveDot();
         syncConflictBanner();
+        updateDocumentStats(tab);
     }}
     refreshTab(tab);
     syncWindowTitle();
@@ -3636,6 +3829,7 @@ document.getElementById('editor').addEventListener('input', function() {{
     }}
     scheduleUndoSnapshot(tab);
     scheduleAutosave(tab);
+    scheduleDocumentStats(tab);
 }});
 
 var scrollSyncSource = null;
@@ -5544,6 +5738,7 @@ class PreviewApp:
         }
         try:
             self._window = webview.create_window("PreviewMD", menu=build_application_menu(self), **window_options)
+            self._attach_window_events()
             log.info(
                 "Window created at %sx%s (min %sx%s)",
                 window_options["width"],
@@ -5559,11 +5754,22 @@ class PreviewApp:
             # both calls.
             log.warning("Custom menu unavailable (%s); retrying without it.", error)
             self._window = webview.create_window("PreviewMD", **window_options)
+            self._attach_window_events()
             webview.start(debug=False)
-        self._window.events.loaded += self._on_loaded
-        self._window.events.closing += self._on_closing
 
         self._cleanup()
+
+    def _attach_window_events(self):
+        """Subscribe before the loop starts, and to whichever window is live.
+
+        `loaded` fires while `webview.start()` is running. Handlers attached
+        after it returns never fire at all, which is why a file passed on the
+        command line, and the whole session restore, silently did nothing: the
+        app came up showing an empty drop zone. The retry path builds a second
+        window, so the handlers have to follow it there too.
+        """
+        self._window.events.loaded += self._on_loaded
+        self._window.events.closing += self._on_closing
 
     def _cleanup(self):
         self._poll_stop.set()

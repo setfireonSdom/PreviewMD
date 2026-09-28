@@ -152,12 +152,17 @@ class ViewModeTests(unittest.TestCase):
         for marker in (
             "--toolbar-bg: #eceae5;",
             "--focus-ring: rgba(125, 143, 128, .40);",
-            "#tab-bar {\n    display: none;\n    height: 36px;\n    background: var(--toolbar-bg);",
+            # The bar is a flex item of the window column, and it is pinned:
+            # unpinned it shrinks by its share of a line whose workspace is as
+            # tall as the document, which squeezed it flat on long pages.
+            "#tab-bar {\n    display: none;\n    height: 36px;\n    /* Pinned: as a flex item",
+            "flex: 0 0 36px;",
             ".toolbar-sep {",
             '#view-modes button[aria-pressed="true"] {\n    background: var(--bg);',
             "#tab-image.editing-visible { display: inline-flex; }",
         ):
             self.assertIn(marker, self.document)
+        self.assertNotIn("body:not(.has-tabs) #main-area { height: 100%; }", self.document)
         for button_id in ("tab-add", "tab-image", "tab-toc", "tab-export"):
             tag, attributes = self.elements[button_id]
             self.assertEqual(tag, "button")

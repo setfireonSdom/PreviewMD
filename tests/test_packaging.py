@@ -7,6 +7,91 @@ import app_metadata
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+class _RecordingEvent:
+    """Stands in for a pywebview event: `handlers += fn` is how you subscribe."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+
+class _RecordingWindow:
+    def __init__(self):
+        self.events = type("Events", (), {"loaded": _RecordingEvent(), "closing": _RecordingEvent()})()
+
+
+class WindowEventSubscriptionTests(unittest.TestCase):
+    """`loaded` fires while `webview.start()` is running, so a handler attached
+    after it returns never fires. That is not a theoretical hazard: it left the
+    app opening an empty window, ignoring both the file given on the command
+    line and the session it was supposed to restore."""
+
+    def setUp(self):
+        import preview
+
+        self.preview = preview
+        self.created = []
+        self.at_start = []
+
+        app = preview.PreviewApp.__new__(preview.PreviewApp)
+        app._pending_files = []
+        app._session = {"tabs": [], "active": 0, "view_mode": "preview",
+                        "positions": {}, "drafts": [], "active_draft": None}
+        app._settings = {}
+        app._api = None
+        app._window = None
+        app._on_loaded = lambda: None
+        app._on_closing = lambda: True
+        app._cleanup = lambda: None
+        self.app = app
+
+    def _run(self, first_start_fails=False):
+        """Drive PreviewApp.run() against a webview that records the order."""
+
+        def create_window(*args, **kwargs):
+            self.created.append(_RecordingWindow())
+            return self.created[-1]
+
+        def start(debug=False, **kwargs):
+            window = self.created[-1]
+            self.at_start.append((len(window.events.loaded.handlers),
+                                  len(window.events.closing.handlers)))
+            if first_start_fails and len(self.at_start) == 1:
+                raise RuntimeError("menu unavailable")
+
+        original_webview = self.preview.webview
+        original_menu = self.preview.build_application_menu
+        self.preview.webview = type(
+            "webview",
+            (),
+            {"create_window": staticmethod(create_window), "start": staticmethod(start)},
+        )()
+        self.preview.build_application_menu = lambda _app: None
+        try:
+            self.app.run()
+        finally:
+            self.preview.webview = original_webview
+            self.preview.build_application_menu = original_menu
+        return self.at_start
+
+    def test_handlers_are_attached_before_the_webview_loop_starts(self):
+        at_start = self._run()
+        self.assertEqual(len(at_start), 1)
+        self.assertEqual(at_start[0], (1, 1))
+
+    def test_the_retry_window_is_subscribed_too(self):
+        # pywebview builds the native menu inside start(), so that is where a
+        # bad menu surfaces. The retry creates a second window; handlers left
+        # behind on the first would leave that window just as inert.
+        at_start = self._run(first_start_fails=True)
+        self.assertEqual(len(self.created), 2, "the menu retry should build a second window")
+        self.assertEqual(len(at_start), 2)
+        self.assertEqual(at_start[-1], (1, 1))
+
+
 class MetadataTests(unittest.TestCase):
     def test_metadata_is_a_single_conventional_source(self):
         self.assertEqual(app_metadata.APP_NAME, "PreviewMD")
@@ -70,8 +155,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("inputs.publish == true", self.workflow)
 
     def test_workflow_builds_both_apple_silicon_and_intel(self):
-        self.assertIn("macos-14", self.workflow)  # Apple Silicon
-        self.assertIn("macos-13", self.workflow)  # Intel Mac
+        # Assert on the runs-on lines, not on the file: the comments next to
+        # them still name the retired images, and matching those would let the
+        # real labels drift to anything while the test stayed green.
+        labels = [label for label in re.findall(r"runs-on:\s*(\S+)", self.workflow) if label.startswith("macos")]
+        self.assertEqual(labels, ["macos-15", "macos-15-intel"])
         self.assertIn("build-intel", self.workflow)
         self.assertIn("needs: [build, build-intel]", self.workflow)
 

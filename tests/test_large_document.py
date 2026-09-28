@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 import subprocess
@@ -88,6 +89,117 @@ class HighlightingTests(unittest.TestCase):
 
     def test_single_lexer_pass_is_no_longer_used(self):
         self.assertNotIn("sanitizeHtml(marked.parse(", self.document)
+
+
+@unittest.skipIf(shutil.which("node") is None, "node is required to run the chunker")
+class DisplayMathBlockTests(unittest.TestCase):
+    """A display formula written across several lines must not be handed to the
+    renderer as several lines.
+
+    PreviewMD enables the GFM breaks behaviour, so a newline becomes a <br>
+    element. The display-math pattern then sees `$$`, <br>, the formula, <br>,
+    `$$` and matches nothing, and the page shows raw LaTeX. The chunker already
+    tracks where a $$ block starts and ends, so it joins those lines; LaTeX reads
+    a newline as a space, so the formula itself is unchanged.
+    """
+
+    CHUNKER_FUNCTIONS = (
+        "markdownLineLooksLikeListItem",
+        "markdownLineIsIndented",
+        "markdownLineContinuesList",
+        "markdownLineWithoutQuotePrefix",
+        "markdownChunkBoundaryIsInsideList",
+        "collapseDisplayMathLines",
+        "splitMarkdownChunks",
+    )
+
+    DRIVER = """
+    var CASES = __CASES__;
+    var out = {};
+    CASES.forEach(function (entry) {
+        out[entry[0]] = splitMarkdownChunks(entry[1]);
+    });
+    console.log(JSON.stringify(out));
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        document = build_html()
+        parts = []
+        for name in cls.CHUNKER_FUNCTIONS:
+            match = re.search(rf"function {name}\(.*?\n\}}", document, re.S)
+            if match is None:
+                raise AssertionError(f"missing function {name}")
+            parts.append(match.group(0))
+        variables = re.search(r"var MARKDOWN_CHUNK_MAX_CHARS = \d+;", document).group(0)
+        variables += "\n" + re.search(r"var LINK_DEFINITION_RE = .*?;", document).group(0)
+        cases = (
+            ("multi line", "前\n\n$$\na^2+b^2\n$$\n\n后"),
+            ("one line", "前\n\n$$a^2+b^2$$\n\n后"),
+            ("indented body", "前\n\n$$\n  \\frac{a}{b}\n$$\n\n后"),
+            ("blank line inside", "前\n\n$$\na^2\n\nb^2\n$$\n\n后"),
+            ("in a fence", "前\n\n```latex\n$$\na^2\n$$\n```\n\n后"),
+            ("in a tilde fence", "前\n\n~~~latex\n$$\na^2\n$$\n~~~\n\n后"),
+            ("unterminated", "前\n\n$$\na^2\n\n后"),
+            ("escaped dollars", "价格 \\$5 与 \\$10"),
+            ("inline math", "前 $a^2$ 后"),
+        )
+        driver = (
+            variables
+            + "\n"
+            + "\n".join(parts)
+            + "\n"
+            + cls.DRIVER.replace("__CASES__", json.dumps(cases, ensure_ascii=False))
+        )
+        result = subprocess.run(["node", "-e", driver], capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise AssertionError(f"node failed: {result.stderr[:2000]}")
+        cls.chunks = {
+            name: payload["chunks"] for name, payload in json.loads(result.stdout.strip()).items()
+        }
+
+    def joined(self, name):
+        return "\n".join(self.chunks[name])
+
+    def test_a_multi_line_formula_becomes_one_line(self):
+        # One line means one text node, which means the display-math pattern can
+        # see the whole formula.
+        self.assertIn("$$ a^2+b^2 $$", self.joined("multi line"))
+        self.assertIn("$$   \\frac{a}{b} $$", self.joined("indented body"))
+        # The blank line becomes the space it already was to LaTeX, which reads a
+        # newline as whitespace.
+        self.assertIn("$$ a^2  b^2 $$", self.joined("blank line inside"))
+
+    def test_a_one_line_formula_is_untouched(self):
+        self.assertIn("$$a^2+b^2$$", self.joined("one line"))
+        self.assertIn("$a^2$", self.joined("inline math"))
+
+    def test_a_fenced_formula_is_never_touched(self):
+        # A notes page that shows LaTeX in a code fence must keep its source.
+        for name in ("in a fence", "in a tilde fence"):
+            with self.subTest(case=name):
+                joined = self.joined(name)
+                self.assertIn("$$\na^2\n$$", joined)
+
+    def test_text_that_is_not_a_formula_is_left_alone(self):
+        # An unterminated $$ was never a formula: its lines stay as they are,
+        # rather than pulling the rest of the document onto one line.
+        self.assertIn("$$\na^2", self.joined("unterminated"))
+        self.assertIn("\\$5 与 \\$10", self.joined("escaped dollars"))
+
+    def test_a_formula_is_never_split_across_chunks(self):
+        # A split formula would leave one chunk holding an odd number of $$; the
+        # unterminated opener is the only case where an odd count is legitimate.
+        for name, chunks in self.chunks.items():
+            if name == "unterminated":
+                continue
+            for chunk in chunks:
+                with self.subTest(case=name):
+                    self.assertEqual(
+                        chunk.count("$$") % 2,
+                        0,
+                        f"{name}: a formula was cut in half by the chunker",
+                    )
 
 
 class PreviewSearchTests(unittest.TestCase):

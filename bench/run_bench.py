@@ -662,6 +662,208 @@ function wait(ms) {
 """
 
 
+MATH_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+(async function () {
+    var results = {};
+    try {
+        // Every spelling of a formula, plus the text that must stay literal.
+        // A display formula spread over several lines used to arrive as $$,
+        // <br>, formula, <br>, $$ and match nothing, so the page showed the
+        // LaTeX source. Only the real engine can show that regression, because
+        // the breaks behaviour is what breaks the formula apart.
+        var cases = {
+            inline: "前 $a^2+b^2$ 后",
+            displayOneLine: "前\n\n$$a^2+b^2$$\n\n后",
+            displayMultiLine: "前\n\n$$\na^2+b^2\n$$\n\n后",
+            displayIndented: "前\n\n$$\n  \\frac{a}{b}\n$$\n\n后",
+            inFence: "前\n\n```latex\n$$\na^2\n$$\n```\n\n后",
+            inInlineCode: "前 `$$a^2$$` 后",
+            escaped: "价格 \\$5 与 \\$10",
+            currency: "预算 $1.75 万亿$ 没问题",
+            unterminated: "前\n\n$$\na^2\n\n后"
+        };
+        var names = Object.keys(cases);
+        results.cases = {};
+        for (var i = 0; i < names.length; i++) {
+            var name = names[i];
+            tabs.splice(0, tabs.length);
+            activeIdx = -1;
+            document.getElementById("content").replaceChildren();
+            window.addTabFromPython(name + ".md", null, cases[name], null);
+            if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+            forceRenderAllMath();
+            await wait(120);
+            var content = document.getElementById("content");
+            results.cases[name] = {
+                katex: content.querySelectorAll(".katex").length,
+                display: content.querySelectorAll(".katex-display").length,
+                errors: content.querySelectorAll(".katex-error").length
+            };
+        }
+        results.expect = {
+            rendered: ["inline", "displayOneLine", "displayMultiLine", "displayIndented"],
+            literal: ["inFence", "inInlineCode", "escaped", "currency", "unterminated"]
+        };
+        results.allRendered = results.expect.rendered.every(function(name) {
+            return results.cases[name].katex > 0 && results.cases[name].errors === 0;
+        });
+        results.allLiteral = results.expect.literal.every(function(name) {
+            return results.cases[name].katex === 0;
+        });
+        results.displayBlocks = results.expect.rendered.slice(1).every(function(name) {
+            return results.cases[name].display === 1;
+        });
+    } catch (error) {
+        results.error = [error && error.name, error && error.message].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
+WORD_COUNT_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+function stats() {
+    return {
+        words: document.getElementById("status-words").textContent,
+        characters: document.getElementById("status-characters").textContent
+    };
+}
+function expected(text) {
+    var counts = countDocumentText(text);
+    return "字数 " + formatCount(counts.words) + " / 字符 " + formatCount(counts.characters);
+}
+function rect(id) {
+    var r = document.getElementById(id).getBoundingClientRect();
+    return { top: Math.round(r.top), bottom: Math.round(r.bottom), height: Math.round(r.height) };
+}
+(async function () {
+    var results = {};
+    try {
+        results.emptyWindow = {
+            display: getComputedStyle(document.getElementById("status-bar")).display,
+            tabBar: rect("tab-bar")
+        };
+
+        var small = "# 标题\n\n短文档，五个汉字。\n";
+        window.addTabFromPython("small.md", null, small, null);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(80);
+        results.opened = { shown: stats(), expected: expected(small) };
+        results.layout = {
+            tabBar: rect("tab-bar"),
+            mainArea: rect("main-area"),
+            statusBar: rect("status-bar"),
+            innerHeight: window.innerHeight
+        };
+        // The tab bar keeps its 36px and the statistics bar its own 24px.
+        results.layoutKeepsBars = results.layout.tabBar.height === 36 &&
+            results.layout.statusBar.height === 24 &&
+            results.layout.mainArea.bottom === results.layout.statusBar.top;
+
+        // Typing follows the keyboard on a small document.
+        setViewMode("edit");
+        await wait(80);
+        var editor = document.getElementById("editor");
+        editor.value = small + "再补六个字。";
+        editor.dispatchEvent(new Event("input", { bubbles: true }));
+        await wait(60);
+        results.afterTyping = { shown: stats(), expected: expected(editor.value) };
+
+        // Undo and redo go through the same path.
+        editor.focus();
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "z", metaKey: true, bubbles: true }));
+        await wait(120);
+        results.afterUndo = { shown: stats(), expected: expected(editor.value) };
+        document.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "z", metaKey: true, shiftKey: true, bubbles: true
+        }));
+        await wait(120);
+        results.afterRedo = { shown: stats(), expected: expected(editor.value) };
+        setViewMode("preview");
+        await wait(60);
+
+        // A second document gets its own numbers.
+        window.addTabFromPython("second.md", null, "# Second\n\nanother document", null);
+        await wait(120);
+        results.secondTab = { shown: stats(), expected: expected("# Second\n\nanother document") };
+        var edited = small + "再补六个字。";
+        switchTab(0);
+        await wait(150);
+        results.backToFirst = { shown: stats(), expected: expected(edited) };
+
+        // An external reload replaces the text.
+        applyDiskSnapshot(tabs[activeIdx], "# 换了内容\n\n全部重写。", null);
+        await wait(120);
+        results.afterDiskReload = { shown: stats(), expected: expected("# 换了内容\n\n全部重写。") };
+
+        // A novel-sized document is counted as soon as it opens: one pass over
+        // millions of characters is cheaper than the render that follows it.
+        var novel = "第三章 雨夜\n\n" + ("他抬头看了一眼窗外的雨，然后继续写下去。\n\n" * 40) * 60;
+        var started = performance.now();
+        window.addTabFromPython("novel.txt", null, novel, null);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        results.large = {
+            shown: stats(),
+            expected: expected(novel),
+            settledInMs: Math.round(performance.now() - started)
+        };
+
+        // Typing in a document past the threshold waits for a pause instead of
+        // recounting the whole thing on every keystroke. Kept to a size the
+        // editor can still lay out, since a textarea holding millions of
+        // characters is impractically slow.
+        var medium = "他抬头看了一眼窗外的雨。\n\n".repeat(15000);
+        window.addTabFromPython("medium.txt", null, medium, null);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(200);
+        var overThreshold = medium.length > WORD_COUNT_FULL_SPEED_CHARS;
+        setViewMode("edit");
+        await wait(150);
+        var editor = document.getElementById("editor");
+        var before = stats();
+        editor.value = medium + "\n\n多写一句。";
+        editor.dispatchEvent(new Event("input", { bubbles: true }));
+        var during = stats();
+        await wait(WORD_COUNT_LARGE_DELAY_MS + 250);
+        results.deferredTyping = {
+            overThreshold: overThreshold,
+            before: before,
+            during: during,
+            after: stats(),
+            expected: expected(editor.value),
+            waitedForPause: during.words === before.words
+        };
+        setViewMode("preview");
+        await wait(60);
+
+        // Closing every document takes the bar away with it. The tabs are marked
+        // saved first: closing dirty work asks for confirmation, and a
+        // headless webview has nobody to answer the dialog.
+        tabs.forEach(function (tab) { tab.dirty = false; tab.savePromise = null; });
+        while (tabs.length) closeTab(0);
+        await wait(150);
+        results.afterClosingAll = {
+            display: getComputedStyle(document.getElementById("status-bar")).display,
+            tabBar: getComputedStyle(document.getElementById("tab-bar")).display
+        };
+    } catch (error) {
+        results.error = [error && error.name, error && error.message, error && error.stack].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
 def synthetic_samples() -> dict[str, str]:
     paragraph = (
         "一般年轻的读者，一看这本书是文言文，也许会以为难得读懂，不感兴趣。"
@@ -824,6 +1026,12 @@ def main() -> int:
         "--font-size", action="store_true", help="verify the reading size control"
     )
     parser.add_argument(
+        "--math", action="store_true", help="verify every spelling of a LaTeX formula"
+    )
+    parser.add_argument(
+        "--word-count", action="store_true", help="verify the statistics bar at the bottom"
+    )
+    parser.add_argument(
         "--repeat",
         type=int,
         default=0,
@@ -875,6 +1083,18 @@ def main() -> int:
     if args.font_size:
         sample = samples[next(iter(samples))]
         report = run_in_webview(build_page(sample, args.editor), FONT_SIZE_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.math:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), MATH_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.word_count:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), WORD_COUNT_WORKLOAD)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 
