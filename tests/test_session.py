@@ -223,7 +223,7 @@ class SessionBridgeTests(unittest.TestCase):
 
 
 class NativeDropTests(unittest.TestCase):
-    def test_native_drop_opens_markdown_paths_and_reports_others(self):
+    def test_native_drop_records_markdown_paths_for_the_page_to_ask_for(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             note = Path(temporary_directory) / "note.md"
             note.write_text("body", encoding="utf-8")
@@ -232,31 +232,92 @@ class NativeDropTests(unittest.TestCase):
 
             app = PreviewApp(session_path=str(Path(temporary_directory) / "session.json"))
             app._window = FakeWindow()
-            loaded = []
-            with mock.patch.object(app, "load_file", side_effect=loaded.append):
+
+            with mock.patch.object(app, "load_file") as loader:
                 app.handle_native_drop({"dataTransfer": {"files": [
                     {"pywebviewFullPath": str(note)},
                     {"pywebviewFullPath": str(image)},
                     {"name": "without-path.md"},
                 ]}})
 
-            self.assertEqual(loaded, [str(note)])
-            self.assertEqual(app._window.scripts, [])
-
-            with mock.patch.object(app, "load_file") as loader:
-                app.handle_native_drop({"dataTransfer": {"files": [{"pywebviewFullPath": str(image)}]}})
+            # The page already opened the file by reading it; opening it again
+            # here is what used to leave two tabs, or none at all.
             loader.assert_not_called()
-            self.assertIn("showStatus", app._window.scripts[-1])
+            self.assertEqual(app._window.scripts, [])
+            self.assertEqual(app._dropped_paths, {"note.md": str(note)})
 
-    def test_register_native_drop_marks_the_page_ready(self):
+    def test_a_dropped_file_becomes_a_watched_document(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            note = Path(temporary_directory) / "note.md"
+            note.write_text("正文", encoding="utf-8")
+
+            app = PreviewApp(session_path=str(Path(temporary_directory) / "session.json"))
+            app._window = FakeWindow()
+            watched = []
+            app._dropped_paths["note.md"] = str(note)
+            with mock.patch.object(app, "_start_watching", side_effect=lambda p, c: watched.append(p)):
+                response = app.attach_dropped_path("note.md")
+
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["path"], str(note))
+            self.assertEqual(response["content"], "正文")
+            self.assertEqual(response["hash"], app._hash_content("正文"))
+            self.assertEqual(watched, [str(note)])
+            # Consumed, so a later file of the same name cannot inherit it.
+            self.assertEqual(app._dropped_paths, {})
+
+    def test_a_drop_without_a_real_path_still_opens_as_a_draft(self):
+        app = PreviewApp(session_path="/tmp/previewmd-drop-test.json")
+        app._window = FakeWindow()
+
+        with mock.patch.object(app, "_start_watching") as watcher:
+            response = app.attach_dropped_path("dropped.md")
+
+        self.assertEqual(response, {"ok": False})
+        watcher.assert_not_called()
+
+    def test_a_missing_file_is_reported_instead_of_silently_kept(self):
+        app = PreviewApp(session_path="/tmp/previewmd-drop-missing.json")
+        app._window = FakeWindow()
+        app._dropped_paths["gone.md"] = "/tmp/previewmd-does-not-exist/gone.md"
+
+        with self.assertLogs("previewmd", level="WARNING"):
+            response = app.attach_dropped_path("gone.md")
+
+        self.assertEqual(response["ok"], False)
+
+    def test_the_page_is_asked_again_when_the_native_path_arrives_late(self):
+        import preview
+
+        app = PreviewApp(session_path="/tmp/previewmd-drop-race.json")
+        app._window = FakeWindow()
+        original = app.attach_dropped_path
+
+        def attach(name):
+            # Stand in for the native callback landing after the page asked.
+            app._dropped_paths["late.md"] = "/tmp/late.md"
+            return original(name)
+
+        with mock.patch.object(app, "_start_watching"), \
+                mock.patch.object(preview, "read_document", return_value=("x", "utf-8-sig")), \
+                mock.patch.object(preview, "os") as fake_os:
+            fake_os.path.isfile.return_value = True
+            response = attach("late.md")
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["path"], "/tmp/late.md")
+
+    def test_register_native_drop_keeps_the_listener_that_collects_paths(self):
         app = PreviewApp(session_path="/tmp/previewmd-test-session.json")
         window = FakeWindow()
         app._window = window
 
         app._register_native_drop()
 
+        # pywebview only gathers the native paths while a drop listener exists.
         self.assertEqual(window.dom.body.listeners[0][0], "drop")
-        self.assertIn("window.previewmdNativeDropReady = true", window.scripts)
+        # Nothing tells the page to stop reading files itself any more.
+        self.assertNotIn("window.previewmdNativeDropReady = true", window.scripts)
 
 
 class SaveAsTests(unittest.TestCase):
@@ -425,7 +486,9 @@ class FeatureMarkerTests(unittest.TestCase):
             "window.finishSessionRestore = function(state)",
             "function newUntitledTab()",
             "function saveFileAs()",
-            "window.previewmdNativeDropReady = false;",
+            "function attachDroppedPath(name)",
+            "window.upgradeDroppedTab = function(response)",
+            "callBridge('attach_dropped_path', name)",
             'id="tab-new"',
             "save_file_as",
             "function saveFile()",
@@ -436,8 +499,7 @@ class FeatureMarkerTests(unittest.TestCase):
             "response.display_path || response.name",
             "tabState.path ? (tabState.name + stateLabel + '\\n' + tabState.path)",
             "function refreshTab(tabState)",
-            "function tabElement(tabState)",
-            "var lastSentTitle = null;",
+            "function tabElement(tabState)",            "var lastSentTitle = null;",
             "function reloadActiveTab()",
             "async function reloadActiveTab()",
             "reload_file",

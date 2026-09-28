@@ -2324,7 +2324,6 @@ function liveRenderDelay(text) {{
 var activeTocId = null;
 var tocButtons = new Map();
 var lastNativeDirtyState = null;
-window.previewmdNativeDropReady = false;
 
 function hasUnsavedWork() {{
     return tabs.some(function(tab) {{ return tab.dirty || !!tab.savePromise; }});
@@ -4926,24 +4925,57 @@ function handleFileDrop(e) {{
         return;
     }}
 
-    // The native bridge resolves real paths when pywebview supports it.
-    if (window.previewmdNativeDropReady === true) return;
-
-    if (window.pywebview && accepted[0].path) {{
-        accepted.forEach(function(file) {{
-            callBridge('dropped_file', file.path).catch(function() {{}});
-        }});
-        return;
-    }}
-
+    // The page reads the file itself. A dropped File is readable in every
+    // engine, so this can never be the thing that fails; whether the drop also
+    // yields a real path is a separate question, asked afterwards. It used to
+    // be the other way round, and when the native path did not arrive the drop
+    // died silently with the readable file still sitting in the event.
     accepted.forEach(function(file) {{
         var reader = new FileReader();
         reader.onload = function(ev) {{
-            addTab(file.name || 'untitled.md', null, ev.target.result);
+            var name = file.name || 'untitled.md';
+            addTab(name, null, ev.target.result);
+            attachDroppedPath(name);
         }};
         reader.readAsText(file);
     }});
 }}
+
+// Turn the tab a drop just opened into a real, watched document. The bytes are
+// re-read from disk by Python so the tab and the file watcher agree on what the
+// document is, and so a dropped file gets autosave like any other.
+function attachDroppedPath(name) {{
+    if (!window.pywebview) return;
+    callBridge('attach_dropped_path', name).then(function(response) {{
+        if (response && response.ok) window.upgradeDroppedTab(response);
+    }}).catch(function() {{}});
+}}
+
+window.upgradeDroppedTab = function(response) {{
+    var index = -1;
+    for (var i = 0; i < tabs.length; i++) {{
+        // Only the tab the drop created has this name and no location yet.
+        if (tabs[i].name === response.name && !tabs[i].path) {{ index = i; break; }}
+    }}
+    if (index < 0) return false;
+    var tab = tabs[index];
+    tab.path = response.path;
+    tab.content = response.content;
+    tab.savedContent = response.content;
+    tab.diskHash = response.hash;
+    tab.dirty = false;
+    tab.conflict = false;
+    tab.externallyChanged = false;
+    tab.externalContent = null;
+    if (index === activeIdx) {{
+        if (hasEditor()) setEditorContent(response.content, false);
+        if (hasPreview()) renderContent(response.content, response.path, true, tab);
+    }}
+    refreshTab(tab);
+    syncWindowTitle();
+    syncSession();
+    return true;
+}};
 
 // ── Python bridge ──
 function openNewFile() {{
@@ -5101,6 +5133,10 @@ class Api:
         """Called from JS when drag-drop provides a file path."""
         if filepath and filepath.lower().endswith((".md", ".txt")) and os.path.isfile(filepath):
             self._app.load_file(filepath)
+
+    def attach_dropped_path(self, name):
+        """Called from JS after the page opened a dropped file without a path."""
+        return self._app.attach_dropped_path(name)
 
     def reopen_path(self, filepath):
         """Re-open a recently closed document so the file watch is restored."""
@@ -5380,6 +5416,10 @@ class PreviewApp:
         self._poll_stop = threading.Event()
         self._poll_thread = None
         self._pending_files = []
+        # Real paths from a native drop, keyed by file name. The page asks for
+        # one after reading a dropped file, which can be before or after the
+        # native callback records it.
+        self._dropped_paths = {}
         self._has_unsaved_changes = False
         self._session_path = session_path or session_file_path()
         self._session = load_session(self._session_path)
@@ -5624,22 +5664,77 @@ class PreviewApp:
             watcher["hash"] = new_hash
 
     def handle_native_drop(self, event):
-        """Open every usable path a pywebview native drop reported."""
+        """Record the real path of every file a native drop reported.
+
+        Nothing is opened here. The page has already read the dropped file
+        itself, because a File is readable in every engine, and it then asks for
+        the path. That also settles the ordering: the native callback runs in
+        its own thread and the page's read finishes in its own time, so waiting
+        here for the page to ask is more reliable than the page assuming the
+        path is already known.
+        """
         try:
             files = (event or {}).get("dataTransfer", {}).get("files") or []
         except AttributeError:
             files = []
-        opened = 0
+        if not files:
+            return
+        resolved = 0
         for item in files:
             if not isinstance(item, dict):
                 continue
             path = item.get("pywebviewFullPath")
-            if not path or not path.lower().endswith((".md", ".txt")) or not os.path.isfile(path):
+            if not path or not path.lower().endswith((".md", ".txt")):
                 continue
-            self.load_file(path)
-            opened += 1
-        if opened == 0 and files:
-            self._show_ui_status("Only .md or .txt files can be opened.")
+            self._dropped_paths[os.path.basename(path)] = path
+            resolved += 1
+        log.info("Native drop reported %d file(s), %d with a real path", len(files), resolved)
+
+    def attach_dropped_path(self, name):
+        """Turn a tab the page opened from a drop into a real, watched document.
+
+        Returns the contents read back from disk so the tab, the file watcher
+        and the save path all agree on what the document is. A drop without a
+        real path still works: it stays a draft the user can save by hand.
+        """
+        path = self._resolve_dropped_path(name)
+        if path is None:
+            return {"ok": False}
+        if not os.path.isfile(path):
+            log.warning("The drop reported %s, which is not a file any more", path)
+            return {"ok": False}
+        try:
+            content, _ = read_document(path)
+        except (DocumentReadError, OSError) as error:
+            log.warning("Could not read the dropped file %s: %s", path, error)
+            return {"ok": False, "error": str(error)}
+        self._dropped_paths.pop(name, None)
+        if self._watchers.get(path) is None:
+            self._start_watching(path, content)
+        self._last_directory = os.path.dirname(path)
+        return {
+            "ok": True,
+            "name": os.path.basename(path),
+            "path": path,
+            "content": content,
+            "hash": self._hash_content(content),
+        }
+
+    def _resolve_dropped_path(self, name, timeout=1.5):
+        """The path the native drop recorded for this file name, if it arrives.
+
+        The page asks after reading the file, and the native callback runs in a
+        separate thread, so the two race. Waiting briefly costs nothing and
+        saves a document the user would otherwise have to save by hand.
+        """
+        deadline = time.time() + timeout
+        while True:
+            path = self._dropped_paths.get(name)
+            if path:
+                return path
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.05)
 
     def _show_ui_status(self, message):
         try:
@@ -5648,13 +5743,17 @@ class PreviewApp:
             pass
 
     def _register_native_drop(self):
-        """Let pywebview resolve real drop paths instead of the FileReader fallback."""
+        """Let pywebview resolve real drop paths instead of the FileReader fallback.
+
+        The listener has to stay registered even though nothing is opened from
+        it: pywebview only collects the native paths when at least one drop
+        listener exists, and the page asks for them later.
+        """
         try:
             body = self._window.dom.get_element("body")
             if body is None:
                 return
             body.on("drop", DOMEventHandler(self.handle_native_drop, prevent_default=True))
-            self._window.evaluate_js("window.previewmdNativeDropReady = true")
         except Exception as error:
             log.warning("Native file drop is unavailable: %s", error)
 
@@ -5722,10 +5821,8 @@ class PreviewApp:
         self._pending_files = list(filepaths or [])
         log.info("Opening %d file(s) from the command line", len(self._pending_files))
         html = build_html().replace(
-            "window.previewmdNativeDropReady = false;",
-            "window.previewmdNativeDropReady = false;\nwindow.previewmdSettings = "
-            + json.dumps(self._settings)
-            + ";",
+            "initReadingSize(window.previewmdSettings);",
+            "window.previewmdSettings = " + json.dumps(self._settings) + ";\ninitReadingSize(window.previewmdSettings);",
             1,
         )
         window_options = {
