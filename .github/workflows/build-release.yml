@@ -120,7 +120,20 @@ jobs:
           RELEASE_NAME: ${{ needs.build.outputs.name }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
-          gh release create "$RELEASE_TAG" release-artifacts/*.dmg \
+          # Where the DMG lands inside the artifact depends on how
+          # upload-artifact computed the root it stripped, and merge-multiple
+          # does not flatten it. A fixed depth glob therefore either matches
+          # nothing or silently attaches one architecture, so the files are
+          # located instead of assumed.
+          mapfile -d '' dmgs < <(find release-artifacts -name '*.dmg' -print0)
+          if (( ${#dmgs[@]} == 0 )); then
+            echo "::error::no DMG was downloaded; refusing to publish an empty release"
+            find release-artifacts -type f
+            exit 1
+          fi
+          printf 'Attaching %d file(s):\n' "${#dmgs[@]}"
+          printf '  %s\n' "${dmgs[@]}"
+          gh release create "$RELEASE_TAG" "${dmgs[@]}" \
             --target "$RELEASE_COMMIT" \
             --title "$RELEASE_NAME" \
             --notes 'macOS build for Apple Silicon (arm64) and Intel Mac (x86_64). Ad-hoc signed; not Developer ID signed or notarized. See the README for the one-time Gatekeeper step.'

@@ -154,6 +154,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertRegex(self.workflow, re.compile(r"publish:.*\n(?:.*\n)*?.*default: false"))
         self.assertIn("inputs.publish == true", self.workflow)
 
+    def test_publishing_attaches_both_dmgs_wherever_they_landed(self):
+        # The first 0.2.0 run built both architectures and then failed here:
+        # the DMGs were not one level below release-artifacts, so
+        # `release-artifacts/*.dmg` matched nothing and the release was never
+        # created. The files are located rather than assumed, and an empty set
+        # is an error instead of a release with no assets.
+        self.assertIn("find release-artifacts -name '*.dmg'", self.workflow)
+        self.assertIn("refusing to publish an empty release", self.workflow)
+        self.assertNotIn('gh release create "$RELEASE_TAG" release-artifacts/*.dmg', self.workflow)
+
     def test_workflow_builds_both_apple_silicon_and_intel(self):
         # Assert on the runs-on lines, not on the file: the comments next to
         # them still name the retired images, and matching those would let the
