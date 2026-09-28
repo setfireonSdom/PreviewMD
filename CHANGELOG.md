@@ -5,6 +5,8 @@
 
 ## [未发布]
 
+## [0.2.0] - 2026-09-28
+
 ### 新增
 - 窗口最底部常驻字数统计（`字数 12,965 · 字符 14,406`），与 WPS 同口径：汉字逐字算一个词、英文按词算，标点与空格不计入字数；统计对象是文档源码，因此在三种查看模式下数字一致，也不用等长文档渲染完。切标签、编辑、撤销/重做、磁盘更新都会立刻刷新
 - 纯文本小说的章节导航：没有 Markdown 标题时（少于 3 个），目录侧栏自动识别 `第N章` 行，中文与阿拉伯数字章号都支持，重复章号只保留一条
@@ -48,41 +50,6 @@
 - 目录当前条目用二分查找定位：1253 章的小说滚动时每帧 0.015 ms，目录关闭时完全不参与
 - 进度行加 CSS `contain`，避免更新百分比时让整篇长文重新布局
 - 尊重系统的“减弱动态效果”设置：动画与过渡被关闭，目录跳转改为直接定位
-首个公开发行版本。
-### 阅读与渲染
-- 多标签页文档浏览，支持 `.md` / `.txt`
-- GitHub Flavored Markdown：表格、任务列表、删除线、引用块
-- 代码语法高亮（highlight.js），未标注语言的代码块使用受限语言集自动识别
-- LaTeX 数学公式（KaTeX）：行内 `$E=mc^2$`、块级 `$$...$$`；公式在进入视口时才渲染
-- 目录侧栏：按 h1–h6 生成，随预览滚动高亮当前章节
-- 图片：选择 / 粘贴 / 拖入插入，自动放到文档旁的 `assets/`
-- 图片灯箱：点击放大、滚轮缩放、`Escape` 关闭
-- 导出独立 UTF-8 HTML（本地图片内嵌）、系统打印 / 存储为 PDF
-- 安全渲染：移除脚本、事件属性与危险 URL；外部链接交给系统默认应用打开
-### 编辑
-- `Preview` / `Edit` / `Split` 三种查看模式，Split 实时预览
-- 每个标签独立的撤销 / 重做
-- 可靠自动保存（同目录临时文件 + 原子替换 + 磁盘版本核对）
-- 冲突横幅：`Load disk version` / `Keep my edits`
-- 文件变化自动刷新（文件系统监听 + 2 秒兜底轮询，能识别临时文件 rename 覆盖）
-### 会话
-- 退出前打开的标签页、当前标签与查看模式自动恢复
-- 打开 / 保存对话框默认停在上次使用的文件夹
-### 性能（面向长文档）
-- 按空行分块解析 Markdown：单次词法分析在 JavaScriptCore 上是超线性的，
-  446 KB 文档从约 10 秒降到约 50 毫秒，输出与整篇解析一致
-- 大文档渐进式渲染，首屏立即出现，其余分批在后台补齐
-- 页内搜索不再重渲染文档，命中用 CSS Custom Highlight 范围绘制
-  （8,900 个命中的查询从约 3.5 秒降到约 10 毫秒）
-- 编辑器搜索镜像层不再为每个命中创建 DOM 节点（284 KB 文档从约 67 秒降到约 0.3 秒）
-- 内容未变化时跳过重复渲染；分屏实时预览的防抖随文档体量自适应
-- 目录高亮、滚动同步等高频操作做帧级节流
-### 工程
-- 106 个自动化测试（导出、图片、会话、视图模式、保存与桥接、打包、大文档）
-- `build.sh` 一键构建 `.app` + DMG；GitHub Actions 产出 arm64 与 x86_64 两个安装包
-- `bench/run_bench.py`：离屏 WKWebView 基准，测量首屏、完整渲染、搜索与导出
-[未发布]: https://github.com/setfireonSdom/PreviewMD/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/setfireonSdom/PreviewMD/releases/tag/v0.1.0
 
 ### 修复
 - 阅读字号初始化曾被放在脚本块中段，而 `var FONT_SIZE_STEPS` 声明在末尾。`var` 只提升声明不提升赋值，于是调用时拿到 `undefined`，`.forEach` 抛错，**该语句之后整个脚本块全部不执行**——`window.addTabFromPython` 之类的定义根本不会出现，编辑器整体失效。`node --check` 看不到这类问题，已加一条针对语句顺序的守卫测试
@@ -128,5 +95,6 @@
 - `build.sh` 一键构建 `.app` + DMG；GitHub Actions 产出 arm64 与 x86_64 两个安装包
 - `bench/run_bench.py`：离屏 WKWebView 基准，测量首屏、完整渲染、搜索与导出
 
-[未发布]: https://github.com/setfireonSdom/PreviewMD/compare/v0.1.0...HEAD
+[未发布]: https://github.com/setfireonSdom/PreviewMD/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/setfireonSdom/PreviewMD/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/setfireonSdom/PreviewMD/releases/tag/v0.1.0
