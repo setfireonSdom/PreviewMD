@@ -1034,7 +1034,10 @@ body.has-tabs #tab-bar {{ display: flex; }}
     opacity: .5;
     cursor: default;
 }}
-#tab-image svg, #tab-reload svg, #tab-toc svg, #tab-export svg {{
+/* Every icon in the bar is listed here, because an svg with only a viewBox
+   and no width collapses to 0x0 and paints nothing. #tab-settings was missing
+   from this list, so the reading size button was an empty rounded rectangle. */
+#tab-image svg, #tab-reload svg, #tab-toc svg, #tab-export svg, #tab-settings svg {{
     width: 15px; height: 15px;
     flex-shrink: 0;
 }}
@@ -1399,7 +1402,12 @@ body.has-tabs #workspace {{ display: flex; }}
 }}
 body.toc-open #toc-sidebar {{ display: block; }}
 #settings-menu {{
-    position: absolute;
+    /* Fixed, like the export menu: the tab bar is overflow:auto hidden, which
+       clips an absolutely positioned menu that hangs below it, and the menu is
+       placed with viewport coordinates, so absolute positioning also counted
+       the button's offset twice and pushed the menu off the side of the
+       window. Fixed escapes both. */
+    position: fixed;
     z-index: 40;
     min-width: 168px;
     padding: 4px;
@@ -1761,7 +1769,7 @@ body.edit-mode #content {{ display: none; }}
   </div>
   <div id="settings-wrap">
     <button id="tab-settings" onclick="toggleSettingsMenu(event)" title="Reading size" aria-label="Reading size" aria-haspopup="menu" aria-expanded="false">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12.5 6 9l2.5 2.5L13 6.5"/><path d="M10.5 6.5H13V9"/></svg>
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 13 8 3.5 12.5 13"/><path d="M5.4 9.8h5.2"/></svg>
     </button>
     <div id="settings-menu" role="menu" aria-label="Reading size">
       <div class="settings-label" id="settings-size-label">Text size</div>
@@ -4037,6 +4045,17 @@ function closeSettingsMenu() {{
     document.getElementById('tab-settings').setAttribute('aria-expanded', 'false');
 }}
 
+// A menu hangs below its button and is placed in viewport coordinates, so it is
+// right-aligned with the button and then kept inside the window. A narrow
+// window would otherwise push it off the right edge.
+function placeMenu(menu, anchor, width) {{
+    var rect = anchor.getBoundingClientRect();
+    menu.style.top = (rect.bottom + 5) + 'px';
+    var margin = 6;
+    var limit = Math.max(margin, window.innerWidth - width - margin);
+    menu.style.left = Math.max(margin, Math.min(rect.right - width, limit)) + 'px';
+}}
+
 function toggleSettingsMenu(event) {{
     if (event) event.stopPropagation();
     var menu = document.getElementById('settings-menu');
@@ -4045,10 +4064,10 @@ function toggleSettingsMenu(event) {{
     closeExportMenu();
     if (opening) {{
         var button = document.getElementById('tab-settings');
-        var rect = button.getBoundingClientRect();
-        menu.style.top = (rect.bottom + 4) + 'px';
-        menu.style.left = Math.max(6, rect.left - 40) + 'px';
         menu.classList.add('open');
+        // Placed after opening so the real width is known: a narrow window can
+        // make the menu wider than its min-width.
+        placeMenu(menu, button, menu.offsetWidth);
         button.setAttribute('aria-expanded', 'true');
         syncFontSizeMenu();
         menu.querySelector('button').focus();
@@ -4062,10 +4081,8 @@ function toggleExportMenu(event) {{
     closeExportMenu();
     if (opening) {{
         var button = document.getElementById('tab-export');
-        var rect = button.getBoundingClientRect();
-        menu.style.top = (rect.bottom + 4) + 'px';
-        menu.style.left = Math.max(6, rect.right - 190) + 'px';
         menu.classList.add('open');
+        placeMenu(menu, button, menu.offsetWidth);
         button.setAttribute('aria-expanded', 'true');
         menu.querySelector('button').focus();
     }}
@@ -4896,7 +4913,12 @@ document.getElementById('search-close').addEventListener('click', function() {{
 
     dz.addEventListener('drop', function(e) {{
         e.preventDefault();
-        e.stopPropagation();
+        // No stopPropagation here. This listener sits on the drop zone, which is
+        // a child of the body, and stopping the event would keep pywebview's own
+        // body listener from ever seeing the drop: macOS would still collect the
+        // path, nobody would ask for it, and the first document opened in an
+        // empty window would be a draft that asks where to save. handleFileDrop
+        // is guarded, so the body listener running as well costs nothing.
         dz.classList.remove('drag-over');
         handleFileDrop(e);
     }});
@@ -4910,11 +4932,16 @@ document.body.addEventListener('dragover', function(e) {{
 
 document.body.addEventListener('drop', function(e) {{
     e.preventDefault();
-    e.stopPropagation();
     handleFileDrop(e);
 }});
 
 function handleFileDrop(e) {{
+    // The drop zone and the body both see every drop now, because the drop zone
+    // must not stop the event: pywebview only learns the real path if its own
+    // listener on the body receives it, and without one the document opens as a
+    // draft that asks where to save. Handle it exactly once.
+    if (e.previewmdDropHandled) return;
+    e.previewmdDropHandled = true;
     var dropped = Array.prototype.slice.call((e.dataTransfer && e.dataTransfer.files) || []);
     var accepted = dropped.filter(function(file) {{
         var lowerName = (file.name || '').toLowerCase();
@@ -4951,13 +4978,25 @@ function attachDroppedPath(name) {{
     }}).catch(function() {{}});
 }}
 
-window.upgradeDroppedTab = function(response) {{
+window.upgradeDroppedTab = async function(response) {{
     var index = -1;
     for (var i = 0; i < tabs.length; i++) {{
         // Only the tab the drop created has this name and no location yet.
         if (tabs[i].name === response.name && !tabs[i].path) {{ index = i; break; }}
     }}
     if (index < 0) return false;
+    // The same document may already be open, and the + button would have reused
+    // that tab instead of opening it twice. Dropping a file you already have
+    // open should do the same rather than leave two tabs on one path.
+    var existing = null;
+    for (var j = 0; j < tabs.length; j++) {{
+        if (j !== index && tabs[j].path === response.path) {{ existing = tabs[j]; break; }}
+    }}
+    if (existing) {{
+        await closeTab(index);
+        await switchTab(tabs.indexOf(existing));
+        return true;
+    }}
     var tab = tabs[index];
     tab.path = response.path;
     tab.content = response.content;
@@ -5700,6 +5739,11 @@ class PreviewApp:
         path = self._resolve_dropped_path(name)
         if path is None:
             return {"ok": False}
+        # The watcher is keyed by the normalised path, and save_file always
+        # normalises before it looks one up. A dropped path can still carry a
+        # symlink (/var, /tmp), so normalising here is what keeps the save able
+        # to find the file the drop opened.
+        path = self._normalize_path(path)
         if not os.path.isfile(path):
             log.warning("The drop reported %s, which is not a file any more", path)
             return {"ok": False}

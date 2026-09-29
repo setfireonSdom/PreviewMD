@@ -3,7 +3,14 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的格式，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.2.2] - 2026-09-29
+
+### 修复
+- **空窗口里拖入的第一个文件没有路径，保存时会让你重新选位置**。拖放区（空窗口时那个大卡片）在自己的 `drop` 监听里调了 `stopPropagation()`，而它是 body 的子元素——事件冒泡到 body 时被截住，pywebview 收不到，于是 macOS 明明已经收集到的真实路径没人取，标签成了草稿。这个 `stopPropagation` 是老代码，以前被 FileReader 兜底掩盖了；兜底换成"原生路径优先"之后它才显形。现在拖放区不再截断事件，`handleFileDrop` 加以去重保证文件只打开一次
+- **拖入的文件保存不进去**（提示 `File is not open for saving.`）。文件监听按路径做 key，而 `save_file` 查之前一定会把路径规范化；拖放给的路径可能还带着软链接（`/var`、`/tmp`），两边 key 对不上就查不到。现在拖放路径也先规范化再登记，标签拿到的是规范化后的路径。**只影响路径里带软链接的目录**，所以放在 `~/Downloads` 的文件当时没被测出来
+- **同一个文件拖两次会开两个标签**（都指向同一文件）。`+` 按钮打开是按路径去重的，拖放现在也一致：已有该文件就切过去，不重复开
+- **点字号按钮弹出的菜单看不到**。菜单是 `position: absolute` 而标签栏是 `overflow-x: auto; overflow-y: hidden`，于是菜单在标签栏以下的部分被裁掉；更糟的是菜单按按钮的**视口坐标**定位，而 absolute 是按包裹元素定位，偏移被算了两遍，菜单实际落在窗口右侧 1200px 外。导出菜单本来就是 `fixed`，所以只有字号这一个坏了。现在两个菜单统一走 `placeMenu`：`fixed` 定位、右边缘对齐按钮、并夹在窗口内（窄窗口不会跑出右边）
+- **字号按钮的图标是空的**（一个空白的圆角方块）。给 svg 设尺寸的规则把每个图标按 id 列了出来，漏了 `#tab-settings`，而只有 viewBox、没有宽高的 svg 会塌成 0×0，什么都不画。顺带把那个图标本身也换了：原来那两笔路径是个折线（`l 2.5 2.5` 折回去），根本不是字号的象形；现在是和菜单里一致的 A
 
 ## [0.2.1] - 2026-09-28
 
@@ -100,7 +107,8 @@
 - `build.sh` 一键构建 `.app` + DMG；GitHub Actions 产出 arm64 与 x86_64 两个安装包
 - `bench/run_bench.py`：离屏 WKWebView 基准，测量首屏、完整渲染、搜索与导出
 
-[未发布]: https://github.com/setfireonSdom/PreviewMD/compare/v0.2.1...HEAD
+[未发布]: https://github.com/setfireonSdom/PreviewMD/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/setfireonSdom/PreviewMD/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/setfireonSdom/PreviewMD/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/setfireonSdom/PreviewMD/releases/tag/v0.2.0
 [0.1.0]: https://github.com/setfireonSdom/PreviewMD/releases/tag/v0.1.0

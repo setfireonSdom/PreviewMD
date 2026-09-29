@@ -662,6 +662,91 @@ function wait(ms) {
 """
 
 
+# A menu can have the "open" class and still be invisible: absolutely positioned
+# inside the tab bar it is clipped by the tab bar's overflow, and placed with
+# viewport coordinates it lands outside the window. So this checks what is
+# actually painted where the user looks, not what the class says.
+MENU_WORKLOAD = r"""
+window.__BENCH_DONE = false;
+window.__BENCH_RESULT = null;
+function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+
+// A fixed element is only clipped by an ancestor that makes itself the
+// containing block for fixed descendants.
+function blockingAncestors(element) {
+    var blockers = [];
+    for (var parent = element.parentElement; parent; parent = parent.parentElement) {
+        var style = getComputedStyle(parent);
+        var captures = style.transform !== "none" || style.perspective !== "none" ||
+            style.filter !== "none" || style.backdropFilter !== "none" ||
+            /paint|layout|strict|content/.test(style.contain || "") ||
+            /transform|filter|perspective/.test(style.willChange || "");
+        if (captures) blockers.push(parent.id || parent.tagName);
+    }
+    return blockers;
+}
+
+function inspectMenu(kind) {
+    var button = document.getElementById("tab-" + kind);
+    button.click();
+    var menu = document.getElementById(kind + "-menu");
+    var rect = menu.getBoundingClientRect();
+    var covered = [];
+    // Whatever is on top at the middle of each item is what the user sees, so an
+    // item that is not the topmost thing there is being covered.
+    menu.querySelectorAll("button").forEach(function (item) {
+        var itemRect = item.getBoundingClientRect();
+        var top = document.elementFromPoint(Math.round(itemRect.left + itemRect.width / 2),
+                                            Math.round(itemRect.top + itemRect.height / 2));
+        if (!menu.contains(top)) {
+            covered.push({ item: item.textContent.trim(),
+                           showing: top ? (top.id || top.className || top.tagName) : null });
+        }
+    });
+    var report = {
+        position: getComputedStyle(menu).position,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        // The whole menu has to be inside the window to be readable.
+        insideWindow: rect.left >= 0 && rect.right <= window.innerWidth && rect.top >= 0,
+        rightAlignedWithButton: Math.round(rect.right - button.getBoundingClientRect().right),
+        blockedBy: blockingAncestors(menu),
+        coveredItems: covered,
+        items: menu.querySelectorAll("button").length
+    };
+    report.visible = report.insideWindow && report.blockedBy.length === 0 &&
+        covered.length === 0 && report.width > 0 && report.height > 0;
+    menu.classList.remove("open");
+    button.setAttribute("aria-expanded", "false");
+    return report;
+}
+
+(async function () {
+    var results = {};
+    try {
+        window.addTabFromPython("menu.md", null, "# 标题\n\n正文。", null);
+        if (lastRenderState && lastRenderState.promise) await lastRenderState.promise;
+        await wait(120);
+        results.viewport = [window.innerWidth, window.innerHeight];
+        // Enough tabs to overflow the tab bar, which is what pushes the toolbar
+        // buttons toward the right edge.
+        for (var extra = 0; extra < 5; extra++) {
+            window.addTabFromPython("a-long-tab-name-" + extra + ".md", null, "# 标题\n\n正文。", null);
+        }
+        await wait(200);
+        results.settings = inspectMenu("settings");
+        results.export = inspectMenu("export");
+        results.allVisible = results.settings.visible && results.export.visible;
+    } catch (error) {
+        results.error = [error && error.name, error && error.message].join(" | ");
+    }
+    window.__BENCH_RESULT = JSON.stringify(results);
+    window.__BENCH_DONE = true;
+})();
+"started";
+"""
+
+
 MATH_WORKLOAD = r"""
 window.__BENCH_DONE = false;
 window.__BENCH_RESULT = null;
@@ -890,7 +975,8 @@ def synthetic_samples() -> dict[str, str]:
     }
 
 
-def run_in_webview(html: str, script: str, timeout: float = 300.0) -> dict:
+def run_in_webview(html: str, script: str, timeout: float = 300.0,
+                   size: tuple = (1400.0, 900.0)) -> dict:
     import AppKit
     from Foundation import NSURL, NSDate, NSRunLoop
     from WebKit import WKWebView, WKWebViewConfiguration
@@ -903,7 +989,8 @@ def run_in_webview(html: str, script: str, timeout: float = 300.0) -> dict:
     app.setActivationPolicy_(1)
 
     config = WKWebViewConfiguration.alloc().init()
-    webview = WKWebView.alloc().initWithFrame_configuration_(((0.0, 0.0), (1400.0, 900.0)), config)
+    webview = WKWebView.alloc().initWithFrame_configuration_(
+        ((0.0, 0.0), (size[0], size[1])), config)
     webview.loadHTMLString_baseURL_(html, NSURL.fileURLWithPath_(str(PROJECT_ROOT) + "/"))
 
     deadline = time.time() + timeout
@@ -1032,6 +1119,9 @@ def main() -> int:
         "--word-count", action="store_true", help="verify the statistics bar at the bottom"
     )
     parser.add_argument(
+        "--menus", action="store_true", help="verify the toolbar menus are actually visible"
+    )
+    parser.add_argument(
         "--repeat",
         type=int,
         default=0,
@@ -1083,6 +1173,12 @@ def main() -> int:
     if args.font_size:
         sample = samples[next(iter(samples))]
         report = run_in_webview(build_page(sample, args.editor), FONT_SIZE_WORKLOAD)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.menus:
+        sample = samples[next(iter(samples))]
+        report = run_in_webview(build_page(sample, args.editor), MENU_WORKLOAD)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 

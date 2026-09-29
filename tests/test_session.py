@@ -259,10 +259,11 @@ class NativeDropTests(unittest.TestCase):
                 response = app.attach_dropped_path("note.md")
 
             self.assertTrue(response["ok"])
-            self.assertEqual(response["path"], str(note))
+            # Normalised, because that is the path save_file will look up.
+            self.assertEqual(response["path"], str(note.resolve()))
             self.assertEqual(response["content"], "正文")
             self.assertEqual(response["hash"], app._hash_content("正文"))
-            self.assertEqual(watched, [str(note)])
+            self.assertEqual(watched, [str(note.resolve())])
             # Consumed, so a later file of the same name cannot inherit it.
             self.assertEqual(app._dropped_paths, {})
 
@@ -287,25 +288,71 @@ class NativeDropTests(unittest.TestCase):
         self.assertEqual(response["ok"], False)
 
     def test_the_page_is_asked_again_when_the_native_path_arrives_late(self):
-        import preview
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            late = Path(temporary_directory) / "late.md"
+            late.write_text("迟到的内容", encoding="utf-8")
 
-        app = PreviewApp(session_path="/tmp/previewmd-drop-race.json")
-        app._window = FakeWindow()
-        original = app.attach_dropped_path
+            app = PreviewApp(session_path=str(Path(temporary_directory) / "session.json"))
+            app._window = FakeWindow()
+            original = app.attach_dropped_path
 
-        def attach(name):
-            # Stand in for the native callback landing after the page asked.
-            app._dropped_paths["late.md"] = "/tmp/late.md"
-            return original(name)
+            def attach(name):
+                # Stand in for the native callback landing after the page asked.
+                app._dropped_paths["late.md"] = str(late)
+                return original(name)
 
-        with mock.patch.object(app, "_start_watching"), \
-                mock.patch.object(preview, "read_document", return_value=("x", "utf-8-sig")), \
-                mock.patch.object(preview, "os") as fake_os:
-            fake_os.path.isfile.return_value = True
-            response = attach("late.md")
+            with mock.patch.object(app, "_start_watching"):
+                response = attach("late.md")
 
-        self.assertTrue(response["ok"])
-        self.assertEqual(response["path"], "/tmp/late.md")
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["path"], str(late.resolve()))
+
+    def test_a_dropped_file_can_actually_be_saved(self):
+        # The drop path hands the watcher a path that can still carry a symlink
+        # (/var, /tmp), while save_file always normalises before looking one up.
+        # The two keys then differ and every save came back "File is not open
+        # for saving", so the path is dropped in through a symlink on purpose.
+        with tempfile.TemporaryDirectory() as real_directory:
+            real = Path(real_directory).resolve()
+            (real / "dropped.md").write_text("原文\n", encoding="utf-8")
+            link_parent = Path(tempfile.mkdtemp())
+            link = link_parent / "linked"
+            link.symlink_to(real, target_is_directory=True)
+
+            app = PreviewApp(session_path=str(link_parent / "session.json"))
+            app._window = FakeWindow()
+            app._dropped_paths["dropped.md"] = str(link / "dropped.md")
+
+            response = app.attach_dropped_path("dropped.md")
+            self.addCleanup(app._cleanup)
+
+            self.assertTrue(response["ok"])
+            # The tab is given the normalised path, which is the one save uses.
+            self.assertEqual(response["path"], str(real / "dropped.md"))
+            self.assertIn(response["path"], app._watchers)
+
+            saved = app._api.save_file(response["path"], "改过的内容\n", response["hash"])
+            self.assertTrue(saved["ok"], saved)
+            self.assertEqual((real / "dropped.md").read_text(encoding="utf-8"), "改过的内容\n")
+
+    def test_the_drop_zone_does_not_stop_the_event(self):
+        # The drop zone is a child of the body, and pywebview only learns a
+        # dropped file's real path if its own body listener receives the event.
+        # The drop zone used to stop propagation, so the very first document
+        # opened in an empty window had no path and asked where to save on the
+        # first save. A string assertion cannot prove the event arrives; it pins
+        # the mistake so it cannot be reintroduced silently.
+        from preview import build_html
+
+        document = build_html()
+        drop_zone_handler = document.split("dz.addEventListener('drop'", 1)[1].split("});", 1)[0]
+        # Match the call, not the word: the handler explains in a comment why it
+        # must not stop the event, and a substring search for the bare name would
+        # fail on its own explanation.
+        self.assertNotIn("e.stopPropagation()", drop_zone_handler)
+        self.assertIn("handleFileDrop(e)", drop_zone_handler)
+        # Both handlers now run, so the drop is opened exactly once.
+        self.assertIn("if (e.previewmdDropHandled) return;", document)
 
     def test_register_native_drop_keeps_the_listener_that_collects_paths(self):
         app = PreviewApp(session_path="/tmp/previewmd-test-session.json")
@@ -487,7 +534,7 @@ class FeatureMarkerTests(unittest.TestCase):
             "function newUntitledTab()",
             "function saveFileAs()",
             "function attachDroppedPath(name)",
-            "window.upgradeDroppedTab = function(response)",
+            "window.upgradeDroppedTab = async function(response)",
             "callBridge('attach_dropped_path', name)",
             'id="tab-new"',
             "save_file_as",

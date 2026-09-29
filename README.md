@@ -203,7 +203,7 @@ cd preview_md
 bash build.sh
 ```
 
-产物按版本与架构分目录，例如 `dist/PreviewMD-0.2.1-arm64/`：
+产物按版本与架构分目录，例如 `dist/PreviewMD-0.2.2-arm64/`：
 
 | 文件 | 用途 |
 |------|------|
@@ -216,19 +216,28 @@ bash build.sh
 
 ```bash
 # 双击运行
-open dist/PreviewMD-0.2.1-arm64/PreviewMD.app
+open dist/PreviewMD-0.2.2-arm64/PreviewMD.app
 
 # 命令行打开指定文件
-open -a dist/PreviewMD-0.2.1-arm64/PreviewMD.app your-file.md
+open -a dist/PreviewMD-0.2.2-arm64/PreviewMD.app your-file.md
 
 # 拖拽 .md 文件到程序图标也可打开
 ```
 
-如果想放到"应用程序"目录方便以后使用：
+如果想放到"应用程序"目录方便以后使用，用 `ditto`（macOS 自带的包复制工具）：
 
 ```bash
-cp -r dist/PreviewMD-0.2.1-arm64/PreviewMD.app /Applications/
+ditto dist/PreviewMD-0.2.2-arm64/PreviewMD.app /Applications/PreviewMD.app
 ```
+
+换新版本时要先删掉旧的再复制，否则会出问题：
+
+```bash
+rm -rf /Applications/PreviewMD.app
+ditto dist/PreviewMD-0.2.2-arm64/PreviewMD.app /Applications/PreviewMD.app
+```
+
+> 换版本别用 `cp -r`。目标已存在时 `cp -r` 是把新 app **塞进**旧 app 里面（生成 `PreviewMD.app/PreviewMD.app`），并且会尝试合并内容，于是报一串 `Not a directory`；它还会弄坏 Framework 里的符号链接。`ditto` 才是替换 app 包的正确工具。
 
 然后可以右键任意 `.md` 文件 → 打开方式 → 其他 → 选择 `PreviewMD.app`，勾选"始终以此方式打开"，以后双击 `.md` 就能直接用这个 app 打开。打包后的 Info.plist 已声明 `.md` / `.txt` 文档类型并启用了 argv 传递，因此双击文件和把文件拖到 app 图标上都会直接打开对应文档。
 
@@ -249,8 +258,8 @@ bash build.sh
 
 | 文件 | 用途 |
 |------|------|
-| `dist/PreviewMD-0.2.1-arm64/PreviewMD.app` | 应用程序（30MB） |
-| `dist/PreviewMD-0.2.1-arm64/PreviewMD-0.2.1-arm64.dmg` | 安装包（~10MB，压缩后） |
+| `dist/PreviewMD-0.2.2-arm64/PreviewMD.app` | 应用程序（30MB） |
+| `dist/PreviewMD-0.2.2-arm64/PreviewMD-0.2.2-arm64.dmg` | 安装包（~10MB，压缩后） |
 
 把 DMG 发给对方（AirDrop / 网盘 / 邮件）。如果仓库托管在 GitHub，`.github/workflows/build-release.yml` 会在 push / PR 时自动跑测试并构建 DMG 作为 artifact；在 Actions 页面手动触发该 workflow 并勾选 publish，才会创建 GitHub Release（默认不发布）。
 

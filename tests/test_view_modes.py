@@ -1,3 +1,4 @@
+import re
 import unittest
 from html.parser import HTMLParser
 
@@ -169,6 +170,79 @@ class ViewModeTests(unittest.TestCase):
             self.assertIn("aria-label", attributes)
             self.assertTrue(attributes.get("title"))
         self.assertLess(self.document.index('id="tabs"'), self.document.index('id="tab-add"'))
+
+    def test_every_toolbar_icon_is_given_a_size(self):
+        # An svg with only a viewBox and no width collapses to 0x0 and paints
+        # nothing, so the reading size button was an empty rounded rectangle: the
+        # sizing rule listed every other icon by id and had forgotten this one.
+        # A new toolbar button must not be able to repeat that.
+        style = self.document[self.document.index("<style>"): self.document.index("</style>")]
+        # Comments carry braces and selectors, so they have to go before parsing.
+        style = re.sub(r"/\*.*?\*/", "", style, flags=re.S)
+        sized = set()
+        for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", style):
+            if "width:" not in match.group(2):
+                continue
+            for selector in match.group(1).split(","):
+                selector = " ".join(selector.split())
+                if selector.endswith(" svg") and selector.startswith("#"):
+                    sized.add(selector)
+
+        buttons = re.findall(r'<button id="(tab-[a-z-]+)"[^>]*>\s*<svg', self.document)
+        self.assertGreaterEqual(len(buttons), 6)
+        for button_id in buttons:
+            self.assertIn(
+                f"#{button_id} svg",
+                sized,
+                f"#{button_id} draws an svg but no rule gives it a width, so it "
+                "renders as nothing",
+            )
+
+    def test_toolbar_menus_are_placed_where_the_user_can_see_them(self):
+        # The reading size menu was absolutely positioned inside the tab bar, and
+        # the tab bar scrolls horizontally with overflow-y hidden. That clipped
+        # everything below the bar, and because the menu was placed with the
+        # button's viewport coordinates the offset was counted twice, so it also
+        # landed about 1200px to the right, outside the window. Clicking the
+        # button did nothing visible. The export menu was already fixed and was
+        # fine, which is why only one of the two broke.
+        bar = self.document[self.document.index("#tab-bar {"):]
+        bar = bar[: bar.index("}")]
+        self.assertIn("overflow-y: hidden;", bar, "the premise: the bar clips")
+
+        for menu_id in ("settings-menu", "export-menu"):
+            block = self.document[self.document.index("#" + menu_id + " {"):]
+            block = block[: block.index("}")]
+            self.assertIn(
+                "position: fixed;",
+                block,
+                f"#{menu_id} must be fixed: absolutely positioned it is clipped by "
+                "the tab bar and offset by the button's coordinates",
+            )
+            self.assertNotIn("position: absolute;", block)
+
+        # One placement routine for both, so the two cannot drift apart again.
+        self.assertIn("function placeMenu(menu, anchor, width) {", self.document)
+        self.assertIn("placeMenu(menu, button, menu.offsetWidth);", self.document)
+        self.assertEqual(
+            self.document.count("placeMenu(menu, button, menu.offsetWidth);"),
+            2,
+            "both menus must go through placeMenu",
+        )
+        # Viewport coordinates, and kept inside a narrow window.
+        self.assertIn("var rect = anchor.getBoundingClientRect();", self.document)
+        self.assertIn("window.innerWidth - width - margin", self.document)
+
+        # The menu stays inside its wrapper, which is what the click-outside
+        # handler tests. Moving it to the body would leave it open on every click.
+        for wrap_id, menu_id in (("export-wrap", "export-menu"), ("settings-wrap", "settings-menu")):
+            wrap = self.document[self.document.index('id="' + wrap_id + '"'):]
+            wrap = wrap[: wrap.index("</div>")]
+            self.assertIn('id="' + menu_id + '"', wrap)
+        self.assertIn(
+            "if (!document.getElementById('settings-wrap').contains(event.target)) closeSettingsMenu();",
+            self.document,
+        )
 
     def test_dropzone_is_a_compact_centered_card(self):
         card_tag, _ = self.elements["dropzone-card"]
